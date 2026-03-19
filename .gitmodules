@@ -1,0 +1,3 @@
+[submodule "third_party/DeepFilterNet"]
+	path = third_party/DeepFilterNet
+	url = https://github.com/ilyasben26/DeepFilterNet
