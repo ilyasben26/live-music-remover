@@ -1,4 +1,7 @@
-#![cfg_attr(all(target_os = "windows", not(feature = "dev-console")), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(feature = "dev-console")),
+    windows_subsystem = "windows"
+)]
 
 use std::env;
 use std::future::Future;
@@ -10,7 +13,9 @@ use std::time::Duration;
 
 use clap::{Parser, ValueHint};
 use crossbeam_channel::unbounded;
-use iced::widget::{self, column, container, image, row, slider, text, Container, Image, pick_list};
+use iced::widget::{
+    self, column, container, image, pick_list, row, slider, text, Container, Image,
+};
 use iced::{
     alignment, executor, Alignment, Application, Command, ContentFit, Element, Length, Settings,
     Subscription, Theme,
@@ -75,27 +80,29 @@ pub fn main() -> iced::Result {
             .init();
     });
 
-    SpecView::run(Settings::default())
+    LiveMusicRemover::run(Settings::default())
 }
 
 static mut SPEC_NOISY: Option<Arc<Mutex<SpecImage>>> = None;
 static mut SPEC_ENH: Option<Arc<Mutex<SpecImage>>> = None;
 
-struct SpecView {
-    df_worker: DeepFilterCapture,
+struct LiveMusicRemover {
+    df_worker: Option<DeepFilterCapture>,
     lsnr: f32,
     atten_lim: f32,
     post_filter_beta: f32,
     min_threshdb: f32,
     max_erbthreshdb: f32,
     max_dfthreshdb: f32,
-    noisy_img: image::Handle,
-    enh_img: image::Handle,
+    noisy_img: Option<image::Handle>,
+    enh_img: Option<image::Handle>,
     r_lsnr: RecvLsnr,
     r_noisy: RecvSpec,
     r_enh: RecvSpec,
     s_controls: SendControl,
-    input_device: Option<Fruit>,
+    fruit_test: Option<Fruit>,
+    input_device: Option<String>,
+    output_device: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +127,8 @@ impl std::fmt::Display for Fruit {
 #[derive(Debug, Clone, Copy)]
 pub enum Message {
     None,
+    StartCapture,
+    StopCapture,
     Tick,
     LsnrChanged(f32),
     NoisyChanged,
@@ -185,7 +194,7 @@ impl SpecImage {
     }
 }
 
-impl Application for SpecView {
+impl Application for LiveMusicRemover {
     type Executor = executor::Default;
     type Message = Message;
     type Theme = Theme;
@@ -197,31 +206,9 @@ impl Application for SpecView {
         let (s_enh, r_enh) = unbounded();
         let (s_controls, r_controls) = unbounded();
 
-        let model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
-        log::info!("Using model path: {:?}", model_path);
-        let df_worker = DeepFilterCapture::new(
-            model_path,
-            Some(s_lsnr),
-            Some(s_noisy),
-            Some(s_enh),
-            Some(r_controls),
-        )
-        .expect("Failed to initialize DeepFilterNet audio capturing");
-
-        let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
-        let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
-        let h = (8000 / freq_res) as u32;
-        let (noisy_img, enh_img) = unsafe {
-            SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-            SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-            (
-                SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
-                SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
-            )
-        };
         (
             Self {
-                df_worker,
+                df_worker: None,
                 lsnr: 0.,
                 atten_lim: 100.,
                 post_filter_beta: 0.,
@@ -232,9 +219,11 @@ impl Application for SpecView {
                 r_noisy,
                 r_enh,
                 s_controls,
-                noisy_img,
-                enh_img,
-                input_device: None,
+                noisy_img: None,
+                enh_img: None,
+                fruit_test: None,
+                input_device: Some("CABLE Input".to_string()), // TODO: set to None and use available devices to find CABLE input
+                output_device: Some("Headphones".to_string()), // TODO: set to None and tell the user to choose the output device
             },
             Command::none(),
         )
@@ -251,8 +240,23 @@ impl Application for SpecView {
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::None => (),
+            Message::StartCapture => {
+                log::info!("Starting cleaning ...");
+                self.start_capture(self.input_device.clone(), self.output_device.clone());
+            }
+            Message::StopCapture => {
+                if let Some(worker) = self.df_worker.as_mut() {
+                    log::info!("Stopping cleaning ...");
+                    worker.should_stop().expect("Failed to stop DF worker");
+                }
+                self.df_worker = None;
+                self.noisy_img = None;
+                self.enh_img = None;
+            }
             Message::Exit => {
-                self.df_worker.should_stop().expect("Failed to stop DF worker");
+                if let Some(worker) = self.df_worker.as_mut() {
+                    worker.should_stop().expect("Failed to stop DF worker");
+                }
                 exit(0);
             }
             Message::Tick => {
@@ -270,24 +274,24 @@ impl Application for SpecView {
             }
             Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
             Message::NoisyChanged => {
-                self.noisy_img = unsafe {
+                self.noisy_img = Some(unsafe {
                     SPEC_NOISY
                         .as_ref()
                         .unwrap()
                         .lock()
                         .expect("Failed to lock SPEC_NOISY")
                         .image_handle()
-                };
+                });
             }
             Message::EnhChanged => {
-                self.enh_img = unsafe {
+                self.enh_img = Some(unsafe {
                     SPEC_ENH
                         .as_ref()
                         .unwrap()
                         .lock()
                         .expect("Failed to lock SPEC_ENH")
                         .image_handle()
-                };
+                });
             }
             Message::AttenLimChanged(v) => {
                 self.atten_lim = v;
@@ -320,7 +324,7 @@ impl Application for SpecView {
                     .expect("Failed to send DfControl")
             }
             Message::FruitSelected(fruit) => {
-                self.input_device = Some(fruit);
+                self.fruit_test = Some(fruit);
                 log::info!("Selected fruit: {:?}", fruit);
             }
         }
@@ -334,13 +338,13 @@ impl Application for SpecView {
         ]
         .width(1000),];
 
-        let input_devices = [
+        let fruits = [
             Fruit::Apple,
             Fruit::Orange,
             Fruit::Strawberry,
             Fruit::Tomato,
         ];
-        
+
         #[cfg(feature = "thresholds")]
         let content = {
             content
@@ -376,11 +380,9 @@ impl Application for SpecView {
                 ))
         };
         let content = content
-            .push(pick_list(
-                input_devices,
-                self.input_device,
-                Message::FruitSelected,
-            ))
+            .push(button("Start cleaning").on_press(Message::StartCapture))
+            .push(button("Stop cleaning").on_press(Message::StopCapture))
+            .push(pick_list(fruits, self.fruit_test, Message::FruitSelected))
             .push(slider_view(
                 "Noise Attenuation [dB]",
                 self.atten_lim,
@@ -428,7 +430,7 @@ impl Application for SpecView {
     }
 }
 
-impl SpecView {
+impl LiveMusicRemover {
     fn update_lsnr(&mut self) -> Option<impl Future<Output = Message>> {
         if self.r_lsnr.is_empty() {
             return None;
@@ -459,8 +461,11 @@ impl SpecView {
         Some(async move {
             let n = recv.len();
             unsafe {
-                let mut spec =
-                    SPEC_NOISY.as_mut().unwrap().lock().expect("Failed to lock SPEC_NOISY");
+                let mut spec = SPEC_NOISY
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .expect("Failed to lock SPEC_NOISY");
                 spec.update(recv.iter().take(n), n);
             }
             Message::NoisyChanged
@@ -475,16 +480,28 @@ impl SpecView {
         Some(async move {
             let n = recv.len();
             unsafe {
-                let mut spec = SPEC_ENH.as_mut().unwrap().lock().expect("Failed to lock SPEC_ENH");
+                let mut spec = SPEC_ENH
+                    .as_mut()
+                    .unwrap()
+                    .lock()
+                    .expect("Failed to lock SPEC_ENH");
                 spec.update(recv.iter().take(n), n);
             }
             Message::EnhChanged
         })
     }
     fn specs(&self) -> Container<Message> {
+        if self.df_worker.is_none() {
+            return container(column![]);
+        }
         container(column![
-            spec_view("Noisy", self.noisy_img.clone(), 1000, 250),
-            spec_view("DeepFilterNet Enhanced", self.enh_img.clone(), 1000, 250),
+            spec_view("Noisy", self.noisy_img.clone().unwrap(), 1000, 250),
+            spec_view(
+                "DeepFilterNet Enhanced",
+                self.enh_img.clone().unwrap(),
+                1000,
+                250
+            ),
         ])
     }
 }
@@ -499,12 +516,17 @@ fn spec_view(title: &str, im: image::Handle, width: u16, height: u16) -> Element
     .into()
 }
 fn spec_raw<'a>(im: image::Handle, width: u16, height: u16) -> Container<'a, Message> {
-    container(Image::new(im).width(width).height(height).content_fit(ContentFit::Fill))
-        .max_width(width)
-        .max_height(height)
-        .width(Length::Fill)
-        .center_x()
-        .center_y()
+    container(
+        Image::new(im)
+            .width(width)
+            .height(height)
+            .content_fit(ContentFit::Fill),
+    )
+    .max_width(width)
+    .max_height(height)
+    .width(Length::Fill)
+    .center_x()
+    .center_y()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -536,4 +558,46 @@ fn slider_view<'a>(
 
 fn button(text: &str) -> widget::Button<'_, Message> {
     widget::button(text).padding(10)
+}
+
+impl LiveMusicRemover {
+    fn start_capture(&mut self, input_device: Option<String>, output_device: Option<String>) {
+        let (s_lsnr, r_lsnr) = unbounded();
+        let (s_noisy, r_noisy) = unbounded();
+        let (s_enh, r_enh) = unbounded();
+        let (s_controls, r_controls) = unbounded();
+
+        let model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
+        log::info!("Using model path: {:?}", model_path);
+        let df_worker = DeepFilterCapture::new(
+            model_path,
+            input_device,
+            output_device,
+            Some(s_lsnr),
+            Some(s_noisy),
+            Some(s_enh),
+            Some(r_controls),
+        )
+        .expect("Failed to initialize DeepFilterNet audio capturing");
+
+        let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
+        let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
+        let h = (8000 / freq_res) as u32;
+        let (noisy_img, enh_img) = unsafe {
+            SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
+            SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
+            (
+                SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
+                SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
+            )
+        };
+
+        self.df_worker = Some(df_worker);
+        self.noisy_img = Some(noisy_img);
+        self.enh_img = Some(enh_img);
+        self.r_lsnr = r_lsnr;
+        self.r_noisy = r_noisy;
+        self.r_enh = r_enh;
+        self.s_controls = s_controls;
+    }
 }

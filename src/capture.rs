@@ -162,7 +162,12 @@ fn get_stream_config(
     None
 }
 
-fn remap_interleaved_channels(input: &[f32], input_ch: usize, output: &mut [f32], output_ch: usize) {
+fn remap_interleaved_channels(
+    input: &[f32],
+    input_ch: usize,
+    output: &mut [f32],
+    output_ch: usize,
+) {
     debug_assert_eq!(output.len(), input.len() / input_ch * output_ch);
     let n_frames = input.len() / input_ch;
     for frame in 0..n_frames {
@@ -201,10 +206,16 @@ fn planar_to_interleaved(input: &[f32], channels: usize, output: &mut [f32]) {
 impl AudioSink {
     fn new(sample_rate: u32, device_str: Option<String>) -> Result<Self> {
         let host = cpal::default_host();
-        let mut device = host.default_output_device().expect("no output device available");
+        let mut device = host
+            .default_output_device()
+            .expect("no output device available");
         if let Some(device_str) = device_str {
             for avail_dev in host.output_devices()? {
-                if avail_dev.name()?.to_lowercase().contains(&device_str.to_lowercase()) {
+                if avail_dev
+                    .name()?
+                    .to_lowercase()
+                    .contains(&device_str.to_lowercase())
+                {
                     device = avail_dev
                 }
             }
@@ -212,8 +223,8 @@ impl AudioSink {
         let config = get_stream_config(&device, sample_rate, StreamDirection::Output)
             .expect("No suitable audio output config found.");
 
-        log::info!("Selected audio output device: {}", device.name()?);
-        log::info!("Selected audio output config: {:?}", config);
+        log::info!("selected sink/output device: {}", device.name()?);
+        log::info!("Selected sink/output config: {:?}", config);
 
         Ok(Self {
             stream: None,
@@ -272,10 +283,16 @@ impl AudioSink {
 impl AudioSource {
     fn new(sample_rate: u32, device_str: Option<String>) -> Result<Self> {
         let host = cpal::default_host();
-        let mut device = host.default_input_device().expect("no output device available");
+        let mut device = host
+            .default_input_device()
+            .expect("no output device available");
         if let Some(device_str) = device_str {
             for avail_dev in host.input_devices()? {
-                if avail_dev.name()?.to_lowercase().contains(&device_str.to_lowercase()) {
+                if avail_dev
+                    .name()?
+                    .to_lowercase()
+                    .contains(&device_str.to_lowercase())
+                {
                     device = avail_dev
                 }
             }
@@ -283,8 +300,8 @@ impl AudioSource {
         let config = get_stream_config(&device, sample_rate, StreamDirection::Input)
             .expect("No suitable audio input config found.");
 
-        log::info!("Selected audio input device: {}", device.name()?);
-        log::info!("Selected audio input config: {:?}", config);
+        log::info!("Selected source/input device: {}", device.name()?);
+        log::info!("Selected source/input config: {:?}", config);
 
         Ok(Self {
             stream: None,
@@ -447,7 +464,10 @@ fn get_worker_fn(
                 let out_rows = (0..ch)
                     .map(|c| outframe.row(c).to_vec())
                     .collect::<Vec<_>>();
-                let out_rows = out_rows.iter().map(|row| row.as_slice()).collect::<Vec<_>>();
+                let out_rows = out_rows
+                    .iter()
+                    .map(|row| row.as_slice())
+                    .collect::<Vec<_>>();
                 r.process_into_buffer(&out_rows, buf, None).unwrap();
                 for frame in 0..n_out {
                     for c in 0..ch {
@@ -498,7 +518,9 @@ fn push_spec(spec: ArrayView2<Complex32>, sender: &SendSpec) {
         }
         out[f] = (power / n_ch as f32).max(1e-10).log10() * 10.0;
     }
-    sender.send(out.into_boxed_slice()).expect("Failed to send spectrogram")
+    sender
+        .send(out.into_boxed_slice())
+        .expect("Failed to send spectrogram")
 }
 
 pub fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
@@ -528,13 +550,15 @@ pub struct DeepFilterCapture {
 
 impl Default for DeepFilterCapture {
     fn default() -> Self {
-        DeepFilterCapture::new(None, None, None, None, None)
+        DeepFilterCapture::new(None, None, None, None, None, None, None)
             .expect("Error during DeepFilterCapture initialization")
     }
 }
 impl DeepFilterCapture {
     pub fn new(
         model_path: Option<PathBuf>,
+        input_device: Option<String>,
+        output_device: Option<String>,
         s_lsnr: Option<SendLsnr>,
         s_noisy: Option<SendSpec>,
         s_enh: Option<SendSpec>,
@@ -549,8 +573,11 @@ impl DeepFilterCapture {
         let in_prod = in_prod.into_postponed();
         let out_prod = out_prod.into_postponed();
 
-        let input_device: Option<String> = Some("CABLE Input".to_string());
-        let output_device: Option<String> = Some("Headphones".to_string());
+        // let input_device: Option<String> = Some("CABLE Input".to_string());
+        // let output_device: Option<String> = Some("Headphones".to_string());
+
+        log::debug!("input_device: {:?}", input_device);
+        log::debug!("output_device: {:?}", output_device);
 
         let mut source = AudioSource::new(sr as u32, input_device)?;
         let mut sink = AudioSink::new(sr as u32, output_device)?;
@@ -607,37 +634,43 @@ impl DeepFilterCapture {
     }
 }
 
-#[allow(unused)]
-#[allow(unknown_lints)] // assigning_clones is clippy nightly only
-#[allow(clippy::assigning_clones)]
-pub fn main() -> Result<()> {
-    INIT_LOGGER.call_once(|| {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-            .filter_module("tract_onnx", log::LevelFilter::Error)
-            .filter_module("tract_core", log::LevelFilter::Error)
-            .filter_module("tract_hir", log::LevelFilter::Error)
-            .filter_module("tract_linalg", log::LevelFilter::Error)
-            .format(log_format)
-            .init();
-    });
+// #[allow(unused)]
+// #[allow(unknown_lints)] // assigning_clones is clippy nightly only
+// #[allow(clippy::assigning_clones)]
+// pub fn main() -> Result<()> {
+//     INIT_LOGGER.call_once(|| {
+//         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+//             .filter_module("tract_onnx", log::LevelFilter::Error)
+//             .filter_module("tract_core", log::LevelFilter::Error)
+//             .filter_module("tract_hir", log::LevelFilter::Error)
+//             .filter_module("tract_linalg", log::LevelFilter::Error)
+//             .format(log_format)
+//             .init();
+//     });
 
-    let (lsnr_prod, mut lsnr_cons) = unbounded();
-    let mut model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
-    unsafe {
-        if model_path.is_none() && MODEL_PATH.is_some() {
-            model_path = MODEL_PATH.clone()
-        }
-    }
-    if let Some(p) = model_path.as_ref() {
-        log::info!("Running with model '{:?}'", p);
-    }
-    let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None);
+//     let (lsnr_prod, mut lsnr_cons) = unbounded();
+//     let mut model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
+//     unsafe {
+//         if model_path.is_none() && MODEL_PATH.is_some() {
+//             model_path = MODEL_PATH.clone()
+//         }
+//     }
+//     if let Some(p) = model_path.as_ref() {
+//         log::info!("Running with model '{:?}'", p);
+//     }
+//     let _c = DeepFilterCapture::new(model_path, Some(lsnr_prod), None, None, None);
 
-    loop {
-        sleep(Duration::from_millis(200));
-        while let Ok(lsnr) = lsnr_cons.try_recv() {
-            print!("\rCurrent SNR: {:>5.1} dB{esc}[1;", lsnr, esc = 27 as char);
-        }
-        stdout().flush().unwrap();
+//     loop {
+//         sleep(Duration::from_millis(200));
+//         while let Ok(lsnr) = lsnr_cons.try_recv() {
+//             print!("\rCurrent SNR: {:>5.1} dB{esc}[1;", lsnr, esc = 27 as char);
+//         }
+//         stdout().flush().unwrap();
+//     }
+// }
+
+impl Drop for DeepFilterCapture {
+    fn drop(&mut self) {
+        log::debug!("Dropping DeepFilterCapture");
     }
 }
