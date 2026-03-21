@@ -24,7 +24,10 @@ use image_rs::{imageops, Rgba, RgbaImage};
 
 mod capture;
 mod cmap;
+mod devices;
 use capture::*;
+
+use crate::devices::{find_cable, get_input_devices, get_output_devices, set_output_device};
 
 /// Simple program to sample from a hd5 dataset directory
 #[derive(Parser)]
@@ -103,6 +106,8 @@ struct LiveMusicRemover {
     fruit_test: Option<Fruit>,
     input_device: Option<String>,
     output_device: Option<String>,
+    available_input_devices: Vec<String>,
+    available_output_devices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,11 +129,13 @@ impl std::fmt::Display for Fruit {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Message {
     None,
     StartCapture,
     StopCapture,
+    InputDeviceSelected(String),
+    OutputDeviceSelected(String),
     Tick,
     LsnrChanged(f32),
     NoisyChanged,
@@ -206,6 +213,43 @@ impl Application for LiveMusicRemover {
         let (s_enh, r_enh) = unbounded();
         let (s_controls, r_controls) = unbounded();
 
+        // get devices
+        let available_input_devices = get_input_devices().unwrap_or_else(|e| {
+            log::error!("Failed to get input devices: {}", e);
+            vec![]
+        });
+
+        let available_output_devices = get_output_devices().unwrap_or_else(|e| {
+            log::error!("Failed to get output devices: {}", e);
+            vec![]
+        });
+
+        log::debug!("available_input_devices: {:?}", available_input_devices);
+        log::debug!("available_output_devices: {:?}", available_output_devices);
+
+        // Look for CABLE input and set it if available
+        let input_device = match find_cable() {
+            Ok(name) => {
+                log::info!("Auto-selected input device: {name}");
+                Some(name)
+            }
+            Err(e) => {
+                log::warn!("Could not auto-select 'CABLE Input': {e}");
+                None
+            }
+        };
+
+        let output_device = match set_output_device() {
+            Ok(name) => {
+                log::info!("Auto-selected output device: {name}");
+                Some(name)
+            }
+            Err(e) => {
+                log::warn!("Could not auto-select output device: {e}");
+                None
+            }
+        };
+
         (
             Self {
                 df_worker: None,
@@ -222,8 +266,10 @@ impl Application for LiveMusicRemover {
                 noisy_img: None,
                 enh_img: None,
                 fruit_test: None,
-                input_device: Some("CABLE Input".to_string()), // TODO: set to None and use available devices to find CABLE input
-                output_device: Some("Headphones".to_string()), // TODO: set to None and tell the user to choose the output device
+                input_device,
+                output_device,
+                available_input_devices: available_input_devices,
+                available_output_devices: available_output_devices,
             },
             Command::none(),
         )
@@ -252,6 +298,14 @@ impl Application for LiveMusicRemover {
                 self.df_worker = None;
                 self.noisy_img = None;
                 self.enh_img = None;
+            }
+            Message::InputDeviceSelected(device) => {
+                log::info!("Selected input device: {:?}", device);
+                self.input_device = Some(device);
+            }
+            Message::OutputDeviceSelected(device) => {
+                log::info!("Selected output device: {:?}", device);
+                self.output_device = Some(device);
             }
             Message::Exit => {
                 if let Some(worker) = self.df_worker.as_mut() {
@@ -379,10 +433,59 @@ impl Application for LiveMusicRemover {
                     3.,
                 ))
         };
+
+        let start_enabled =
+            self.df_worker.is_none() && self.input_device.is_some() && self.output_device.is_some();
+        let stop_enabled = self.df_worker.is_some();
+
+        let start_button = {
+            let b = button("Start");
+            if start_enabled {
+                b.on_press(Message::StartCapture)
+            } else {
+                b
+            }
+        };
+
+        let stop_button = {
+            let b = button("Stop");
+            if stop_enabled {
+                b.on_press(Message::StopCapture)
+            } else {
+                b
+            }
+        };
+
+        let mut start_row = row![start_button];
+        if self.df_worker.is_none() && (!start_enabled) {
+            // Only show warning if devices are not selected
+            if self.input_device.is_none() || self.output_device.is_none() {
+                start_row = start_row.push(
+                    text("Select input and output devices to start.")
+                        .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                            1.0, 0.2, 0.2,
+                        )))
+                        .size(16),
+                );
+            }
+        }
+
         let content = content
-            .push(button("Start cleaning").on_press(Message::StartCapture))
-            .push(button("Stop cleaning").on_press(Message::StopCapture))
-            .push(pick_list(fruits, self.fruit_test, Message::FruitSelected))
+            .push(text("Input device:"))
+            .push(pick_list(
+                self.available_input_devices.as_slice(),
+                self.input_device.clone(),
+                Message::InputDeviceSelected,
+            ))
+            .push(text("Output device:"))
+            .push(pick_list(
+                self.available_output_devices.as_slice(),
+                self.output_device.clone(),
+                Message::OutputDeviceSelected,
+            ))
+            .push(start_row)
+            .push(stop_button)
+            // .push(pick_list(fruits, self.fruit_test, Message::FruitSelected))
             .push(slider_view(
                 "Noise Attenuation [dB]",
                 self.atten_lim,
