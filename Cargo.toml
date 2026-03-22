@@ -9,19 +9,14 @@ path = "src/main.rs"
 required-features = ["ui"]
 
 [features]
-ui = ["iced", "image_rs"]
+ui = ["eframe", "image_rs"]
 default-model-ll = ["deep_filter/default-model-ll"]
 thresholds = []
 dev-console = []
 
 
 [dependencies]
-iced = { version = "0.12", features = [
-  "image",
-  "debug",
-  "tokio",
-  "lazy",
-], optional = true }
+eframe = { version = "0.31.1", optional = true, features = ["default"] }
 itertools = "0.12"
 crossbeam-channel = "0.5"
 image_rs = { package = "image", version = "0.24", optional = true }
@@ -39,3 +34,8 @@ ringbuf = "0.3"
 env_logger = "0.10"
 log = { version = "0.4", features = ["std"] }
 thiserror = "1.0"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+    "Win32_UI_WindowsAndMessaging"
+] }

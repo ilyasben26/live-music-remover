@@ -4,22 +4,12 @@
 )]
 
 use std::env;
-use std::future::Future;
 use std::path::PathBuf;
-use std::process::exit;
-use std::sync::{Arc, Mutex};
-use std::thread::sleep;
 use std::time::Duration;
 
 use clap::{Parser, ValueHint};
 use crossbeam_channel::{unbounded, Receiver};
-use iced::widget::{
-    self, column, container, image, pick_list, row, slider, text, Container, Image,
-};
-use iced::{
-    alignment, executor, Alignment, Application, Command, ContentFit, Element, Length, Settings,
-    Subscription, Theme,
-};
+use eframe::egui;
 use image_rs::{imageops, Rgba, RgbaImage};
 
 mod capture;
@@ -49,7 +39,7 @@ struct Args {
     verbose: u8,
 }
 
-pub fn main() -> iced::Result {
+pub fn main() -> eframe::Result<()> {
     let args = Args::parse();
     let level = match args.verbose {
         0 => log::LevelFilter::Warn,
@@ -74,22 +64,28 @@ pub fn main() -> iced::Result {
             .filter_module("tract_hir", tract_level)
             .filter_module("tract_core", tract_level)
             .filter_module("tract_linalg", tract_level)
-            .filter_module("iced_winit", log::LevelFilter::Error)
-            .filter_module("iced_wgpu", log::LevelFilter::Error)
+            .filter_module("eframe", log::LevelFilter::Error)
+            .filter_module("egui_wgpu", log::LevelFilter::Error)
             .filter_module("wgpu_core", log::LevelFilter::Error)
             .filter_module("wgpu_hal", log::LevelFilter::Error)
             .filter_module("naga", log::LevelFilter::Error)
-            .filter_module("crossfont", log::LevelFilter::Error)
-            .filter_module("cosmic_text", log::LevelFilter::Error)
             .format(capture::log_format)
             .init();
     });
 
-    LiveMusicRemover::run(Settings::default())
-}
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("DeepFilterNet Demo")
+            .with_inner_size([1100.0, 900.0]),
+        ..Default::default()
+    };
 
-static mut SPEC_NOISY: Option<Arc<Mutex<SpecImage>>> = None;
-static mut SPEC_ENH: Option<Arc<Mutex<SpecImage>>> = None;
+    eframe::run_native(
+        "DeepFilterNet Demo",
+        options,
+        Box::new(|_cc| Ok(Box::new(LiveMusicRemover::new()))),
+    )
+}
 
 struct LiveMusicRemover {
     df_worker: Option<DeepFilterCapture>,
@@ -99,59 +95,19 @@ struct LiveMusicRemover {
     min_threshdb: f32,
     max_erbthreshdb: f32,
     max_dfthreshdb: f32,
-    noisy_img: Option<image::Handle>,
-    enh_img: Option<image::Handle>,
+    spec_noisy: Option<SpecImage>,
+    spec_enh: Option<SpecImage>,
+    noisy_texture: Option<egui::TextureHandle>,
+    enh_texture: Option<egui::TextureHandle>,
     r_lsnr: RecvLsnr,
     r_noisy: RecvSpec,
     r_enh: RecvSpec,
     s_controls: SendControl,
-    fruit_test: Option<Fruit>,
     input_device: Option<String>,
     output_device: Option<String>,
     available_input_devices: Vec<String>,
     available_output_devices: Vec<String>,
     r_device_event: Option<Receiver<DeviceEvent>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Fruit {
-    Apple,
-    Orange,
-    Strawberry,
-    Tomato,
-}
-
-impl std::fmt::Display for Fruit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Apple => "Apple",
-            Self::Orange => "Orange",
-            Self::Strawberry => "Strawberry",
-            Self::Tomato => "Tomato",
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum Message {
-    None,
-    StartCapture,
-    StopCapture,
-    InputDeviceSelected(String),
-    OutputDeviceSelected(String),
-    RefreshDevices,
-    Tick,
-    DeviceLost(DeviceEvent),
-    LsnrChanged(f32),
-    NoisyChanged,
-    EnhChanged,
-    AttenLimChanged(f32),
-    PostFilterChanged(f32),
-    MinThreshDbChanged(f32),
-    MaxErbThreshDbChanged(f32),
-    MaxDfThreshDbChanged(f32),
-    Exit,
-    FruitSelected(Fruit),
 }
 
 struct SpecImage {
@@ -187,12 +143,10 @@ impl SpecImage {
             return;
         }
         if n_specs >= self.n_frames as usize {
-            // Just drop a few
             n_specs = self.n_frames as usize - 1;
         }
         for (spec, im_row) in specs.take(n_specs).zip(self.im.rows_mut()) {
             for (s, x) in spec.iter().zip(im_row) {
-                // clamp and normalize
                 let v = (s.min(self.vmax).max(self.vmin) - self.vmin) / (self.vmax - self.vmin);
                 *x = Rgba(cmap::CMAP_INFERNO[(v * 255.) as usize]);
             }
@@ -200,26 +154,27 @@ impl SpecImage {
         let (w, h) = (self.w(), self.h());
         self.im.rotate_left((w - n_specs) * 4 * h);
     }
-    fn image_handle(&self) -> image::Handle {
-        let imt_buf = imageops::rotate270(&self.im).as_raw().to_vec();
-        image::Handle::from_pixels(self.n_frames, self.n_freqs, imt_buf)
+    fn to_color_image(&self) -> egui::ColorImage {
+        let rotated = imageops::rotate270(&self.im);
+        let pixels: Vec<egui::Color32> = rotated
+            .pixels()
+            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+            .collect();
+        egui::ColorImage {
+            size: [self.n_frames as usize, self.n_freqs as usize],
+            pixels,
+        }
     }
 }
 
-impl Application for LiveMusicRemover {
-    type Executor = executor::Default;
-    type Message = Message;
-    type Theme = Theme;
-    type Flags = ();
+impl LiveMusicRemover {
+    fn new() -> Self {
+        let (_s_lsnr, r_lsnr) = unbounded();
+        let (_s_noisy, r_noisy) = unbounded();
+        let (_s_enh, r_enh) = unbounded();
+        let (s_controls, _r_controls) = unbounded();
+        let (_s_device_event, r_device_event) = unbounded();
 
-    fn new(_flags: ()) -> (Self, Command<Message>) {
-        let (s_lsnr, r_lsnr) = unbounded();
-        let (s_noisy, r_noisy) = unbounded();
-        let (s_enh, r_enh) = unbounded();
-        let (s_controls, r_controls) = unbounded();
-        let (s_device_event, r_device_event) = unbounded();
-
-        // get devices
         let available_input_devices = get_input_devices().unwrap_or_else(|e| {
             log::error!("Failed to get input devices: {}", e);
             vec![]
@@ -233,7 +188,6 @@ impl Application for LiveMusicRemover {
         log::debug!("available_input_devices: {:?}", available_input_devices);
         log::debug!("available_output_devices: {:?}", available_output_devices);
 
-        // Look for CABLE input and set it if available
         let input_device = match find_cable() {
             Ok(name) => {
                 log::info!("Auto-selected input device: {name}");
@@ -256,534 +210,116 @@ impl Application for LiveMusicRemover {
             }
         };
 
-        (
-            Self {
-                df_worker: None,
-                lsnr: 0.,
-                atten_lim: 100.,
-                post_filter_beta: 0.,
-                min_threshdb: -15.,
-                max_erbthreshdb: 35.,
-                max_dfthreshdb: 35.,
-                r_lsnr,
-                r_noisy,
-                r_enh,
-                s_controls,
-                noisy_img: None,
-                enh_img: None,
-                fruit_test: None,
-                input_device,
-                output_device,
-                available_input_devices: available_input_devices,
-                available_output_devices: available_output_devices,
-                r_device_event: Some(r_device_event),
-            },
-            Command::none(),
-        )
-    }
-
-    fn title(&self) -> String {
-        "DeepFilterNet Demo".to_string()
-    }
-
-    // fn theme(&self) -> Self::Theme {
-    //     Theme::Dark
-    // }
-
-    fn update(&mut self, message: Message) -> Command<Message> {
-        match message {
-            Message::None => (),
-            Message::StartCapture => {
-                log::info!("Starting cleaning ...");
-                self.start_capture(self.input_device.clone(), self.output_device.clone());
-            }
-            Message::StopCapture => {
-                self.stop_capture();
-                self.noisy_img = None;
-                self.enh_img = None;
-            }
-            Message::InputDeviceSelected(device) => {
-                log::info!("Selected input device: {:?}", device);
-                self.refresh_devices();
-                if self.df_worker.is_some() {
-                    // if capture is running update the device on the fly
-                    if device_exists(Some(device.as_str()), &self.available_input_devices) {
-                        self.stop_capture();
-                        self.noisy_img = None;
-                        self.enh_img = None;
-
-                        self.input_device = Some(device);
-
-                        self.start_capture(self.input_device.clone(), self.output_device.clone());
-                    } else {
-                        self.stop_capture();
-                        self.noisy_img = None;
-                        self.enh_img = None;
-
-                        self.auto_select_input_device();
-                        self.start_capture(self.input_device.clone(), self.output_device.clone());
-                    }
-                } else {
-                    // if capture is not running
-                    if device_exists(Some(device.as_str()), &self.available_input_devices) {
-                        self.input_device = Some(device);
-                    } else {
-                        self.auto_select_input_device();
-                    }
-                }
-            }
-            Message::OutputDeviceSelected(device) => {
-                log::info!("Selected output device: {:?}", device);
-                self.refresh_devices();
-                if self.df_worker.is_some() {
-                    // if capture is running update the device on the fly
-                    if device_exists(Some(device.as_str()), &self.available_output_devices) {
-                        self.stop_capture();
-                        self.noisy_img = None;
-                        self.enh_img = None;
-
-                        self.output_device = Some(device);
-
-                        self.start_capture(self.input_device.clone(), self.output_device.clone());
-                    } else {
-                        self.stop_capture();
-                        self.noisy_img = None;
-                        self.enh_img = None;
-
-                        self.auto_select_output_device();
-                        self.start_capture(self.input_device.clone(), self.output_device.clone());
-                    }
-                } else {
-                    // if capture is not running
-                    if device_exists(Some(device.as_str()), &self.available_output_devices) {
-                        self.output_device = Some(device);
-                    } else {
-                        self.auto_select_output_device();
-                    }
-                }
-            }
-            Message::RefreshDevices => {
-                self.refresh_devices();
-
-                // check if the selected input and output devices still exist, otherwise auto-select them
-                if !device_exists(self.input_device.as_deref(), &self.available_input_devices) {
-                    self.auto_select_input_device();
-                }
-
-                if !device_exists(
-                    self.output_device.as_deref(),
-                    &self.available_output_devices,
-                ) {
-                    self.auto_select_output_device();
-                }
-            }
-            Message::Exit => {
-                if let Some(worker) = self.df_worker.as_mut() {
-                    worker.should_stop().expect("Failed to stop DF worker");
-                }
-                exit(0);
-            }
-            Message::Tick => {
-                let mut commands = Vec::new();
-                if let Some(task) = self.update_lsnr() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(task) = self.update_noisy() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(task) = self.update_enh() {
-                    commands.push(Command::perform(task, move |message| message))
-                }
-                if let Some(ref r_device_event) = self.r_device_event {
-                    if !r_device_event.is_empty() {
-                        if let Ok(event) = r_device_event.try_recv() {
-                            commands.push(Command::perform(
-                                async { Message::DeviceLost(event) },
-                                |m| m,
-                            ));
-                        }
-                    }
-                }
-                return Command::batch(commands);
-            }
-            Message::DeviceLost(event) => {
-                log::warn!(
-                    "Audio device lost during capture, resetting UI and refreshing devices."
-                );
-
-                self.df_worker = None;
-                self.noisy_img = None;
-                self.enh_img = None;
-                self.refresh_devices();
-
-                match event {
-                    DeviceEvent::InputLost => {
-                        // auto-select input device
-                        self.input_device = match find_cable() {
-                            Ok(name) => {
-                                log::info!("Auto-selected input device: {name}");
-                                Some(name)
-                            }
-                            Err(e) => {
-                                log::warn!("Could not auto-select input device: {e}");
-                                None
-                            }
-                        };
-                    }
-                    DeviceEvent::OutputLost => {
-                        // auto-select output device
-                        self.output_device = match set_output_device() {
-                            Ok(name) => {
-                                log::info!("Auto-selected output device: {name}");
-                                Some(name)
-                            }
-                            Err(e) => {
-                                log::warn!("Could not auto-select output device: {e}");
-                                None
-                            }
-                        };
-                    }
-                }
-            }
-            Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
-            Message::NoisyChanged => {
-                self.noisy_img = Some(unsafe {
-                    SPEC_NOISY
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .expect("Failed to lock SPEC_NOISY")
-                        .image_handle()
-                });
-            }
-            Message::EnhChanged => {
-                self.enh_img = Some(unsafe {
-                    SPEC_ENH
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .expect("Failed to lock SPEC_ENH")
-                        .image_handle()
-                });
-            }
-            Message::AttenLimChanged(v) => {
-                self.atten_lim = v;
-                self.s_controls
-                    .send((DfControl::AttenLim, v))
-                    .expect("Failed to send DfControl")
-            }
-            Message::PostFilterChanged(v) => {
-                self.post_filter_beta = v;
-                self.s_controls
-                    .send((DfControl::PostFilterBeta, v))
-                    .expect("Failed to send DfControl")
-            }
-            Message::MinThreshDbChanged(v) => {
-                self.min_threshdb = v;
-                self.s_controls
-                    .send((DfControl::MinThreshDb, v))
-                    .expect("Failed to send DfControl")
-            }
-            Message::MaxErbThreshDbChanged(v) => {
-                self.max_erbthreshdb = v;
-                self.s_controls
-                    .send((DfControl::MaxErbThreshDb, v))
-                    .expect("Failed to send DfControl")
-            }
-            Message::MaxDfThreshDbChanged(v) => {
-                self.max_dfthreshdb = v;
-                self.s_controls
-                    .send((DfControl::MaxDfThreshDb, v))
-                    .expect("Failed to send DfControl")
-            }
-            Message::FruitSelected(fruit) => {
-                self.fruit_test = Some(fruit);
-                log::info!("Selected fruit: {:?}", fruit);
-            }
+        Self {
+            df_worker: None,
+            lsnr: 0.,
+            atten_lim: 100.,
+            post_filter_beta: 0.,
+            min_threshdb: -15.,
+            max_erbthreshdb: 35.,
+            max_dfthreshdb: 35.,
+            spec_noisy: None,
+            spec_enh: None,
+            noisy_texture: None,
+            enh_texture: None,
+            r_lsnr,
+            r_noisy,
+            r_enh,
+            s_controls,
+            input_device,
+            output_device,
+            available_input_devices,
+            available_output_devices,
+            r_device_event: Some(r_device_event),
         }
-        Command::none()
     }
 
-    fn view(&self) -> Element<Message> {
-        let content = column![row![
-            text("Live Music Remover").size(40).width(Length::Fill),
-            button("exit").on_press(Message::Exit)
-        ]
-        .width(1000),];
-
-        let fruits = [
-            Fruit::Apple,
-            Fruit::Orange,
-            Fruit::Strawberry,
-            Fruit::Tomato,
-        ];
-
-        #[cfg(feature = "thresholds")]
-        let content = {
-            content
-                .push(slider_view(
-                    "Threshold Min [dB]",
-                    self.min_threshdb,
-                    -15.,
-                    35.,
-                    Message::MinThreshDbChanged,
-                    1000,
-                    0,
-                    3.,
-                ))
-                .push(slider_view(
-                    "Threshold ERB Max [dB]",
-                    self.max_erbthreshdb,
-                    -15.,
-                    35.,
-                    Message::MaxErbThreshDbChanged,
-                    1000,
-                    0,
-                    3.,
-                ))
-                .push(slider_view(
-                    "Threshold DF  Max [dB]",
-                    self.max_dfthreshdb,
-                    -15.,
-                    35.,
-                    Message::MaxDfThreshDbChanged,
-                    1000,
-                    0,
-                    3.,
-                ))
-        };
-
-        let start_enabled =
-            self.df_worker.is_none() && self.input_device.is_some() && self.output_device.is_some();
-        let stop_enabled = self.df_worker.is_some();
-
-        let start_button = {
-            let b = button("Start");
-            if start_enabled {
-                b.on_press(Message::StartCapture)
-            } else {
-                b
-            }
-        };
-
-        let stop_button = {
-            let b = button("Stop");
-            if stop_enabled {
-                b.on_press(Message::StopCapture)
-            } else {
-                b
-            }
-        };
-
-        let mut start_row = row![start_button];
-        if self.df_worker.is_none() && (!start_enabled) {
-            // Only show warning if devices are not selected
-            if self.input_device.is_none() || self.output_device.is_none() {
-                start_row = start_row.push(
-                    text("Select input and output devices to start.")
-                        .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                            1.0, 0.2, 0.2,
-                        )))
-                        .size(16),
-                );
-            }
-        }
-
-        let content = content
-            .push(text("Input device:"))
-            .push(pick_list(
-                self.available_input_devices.as_slice(),
-                self.input_device.clone(),
-                Message::InputDeviceSelected,
-            ))
-            .push(text("Output device:"))
-            .push(pick_list(
-                self.available_output_devices.as_slice(),
-                self.output_device.clone(),
-                Message::OutputDeviceSelected,
-            ))
-            .push(button("Refresh Devices").on_press(Message::RefreshDevices))
-            .push(start_row)
-            .push(stop_button)
-            // .push(pick_list(fruits, self.fruit_test, Message::FruitSelected))
-            .push(slider_view(
-                "Noise Attenuation [dB]",
-                self.atten_lim,
-                0.,
-                100.,
-                Message::AttenLimChanged,
-                1000,
-                0,
-                3.,
-            ))
-            .push(slider_view(
-                "Post Filter Beta",
-                self.post_filter_beta,
-                0.,
-                1.,
-                Message::PostFilterChanged,
-                1000,
-                3,
-                0.001,
-            ))
-            .push(self.specs())
-            .push(
-                row![
-                    text("Current SNR:").size(18),
-                    text(format!("{:>5.1} dB", self.lsnr))
-                        .size(18)
-                        .width(80)
-                        .horizontal_alignment(alignment::Horizontal::Right)
-                ]
-                .spacing(20)
-                .align_items(Alignment::End),
-            );
-
-        container(content)
-            .padding(50)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into()
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(std::time::Duration::from_millis(20)).map(|_| Message::Tick)
-    }
-}
-
-impl LiveMusicRemover {
-    fn update_lsnr(&mut self) -> Option<impl Future<Output = Message>> {
-        if self.r_lsnr.is_empty() {
-            return None;
-        }
-        let recv = self.r_lsnr.clone();
-        Some(async move {
-            sleep(Duration::from_millis(100));
-            let mut lsnr = 0.;
-            let mut n = 0;
-            while let Ok(v) = recv.try_recv() {
+    fn poll_channels(&mut self, ctx: &egui::Context) {
+        // Update LSNR
+        if !self.r_lsnr.is_empty() {
+            let mut lsnr = 0.0f32;
+            let mut n = 0usize;
+            while let Ok(v) = self.r_lsnr.try_recv() {
                 lsnr += v;
                 n += 1;
             }
             if n > 0 {
-                lsnr /= n as f32;
-                Message::LsnrChanged(lsnr)
-            } else {
-                Message::None
+                self.lsnr = lsnr / n as f32;
             }
-        })
-    }
-
-    fn update_noisy(&mut self) -> Option<impl Future<Output = Message>> {
-        if self.r_noisy.is_empty() {
-            return None;
         }
-        let recv = self.r_noisy.clone();
-        Some(async move {
-            let n = recv.len();
-            unsafe {
-                let mut spec = SPEC_NOISY
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .expect("Failed to lock SPEC_NOISY");
-                spec.update(recv.iter().take(n), n);
+
+        // Update noisy spectrogram
+        if !self.r_noisy.is_empty() {
+            let specs: Vec<_> = self.r_noisy.try_iter().collect();
+            let n = specs.len();
+            if let Some(spec) = self.spec_noisy.as_mut() {
+                spec.update(specs.into_iter(), n);
+                self.noisy_texture = Some(ctx.load_texture(
+                    "noisy_spec",
+                    spec.to_color_image(),
+                    egui::TextureOptions::LINEAR,
+                ));
             }
-            Message::NoisyChanged
-        })
-    }
-
-    fn update_enh(&mut self) -> Option<impl Future<Output = Message>> {
-        if self.r_enh.is_empty() {
-            return None;
         }
-        let recv = self.r_enh.clone();
-        Some(async move {
-            let n = recv.len();
-            unsafe {
-                let mut spec = SPEC_ENH
-                    .as_mut()
-                    .unwrap()
-                    .lock()
-                    .expect("Failed to lock SPEC_ENH");
-                spec.update(recv.iter().take(n), n);
+
+        // Update enhanced spectrogram
+        if !self.r_enh.is_empty() {
+            let specs: Vec<_> = self.r_enh.try_iter().collect();
+            let n = specs.len();
+            if let Some(spec) = self.spec_enh.as_mut() {
+                spec.update(specs.into_iter(), n);
+                self.enh_texture = Some(ctx.load_texture(
+                    "enh_spec",
+                    spec.to_color_image(),
+                    egui::TextureOptions::LINEAR,
+                ));
             }
-            Message::EnhChanged
-        })
-    }
-    fn specs(&self) -> Container<Message> {
-        if self.df_worker.is_none() {
-            return container(column![]);
         }
-        container(column![
-            spec_view("Noisy", self.noisy_img.clone().unwrap(), 1000, 250),
-            spec_view(
-                "DeepFilterNet Enhanced",
-                self.enh_img.clone().unwrap(),
-                1000,
-                250
-            ),
-        ])
+
+        // Check device events
+        if let Some(ref r_device_event) = self.r_device_event {
+            if let Ok(event) = r_device_event.try_recv() {
+                self.handle_device_lost(event);
+            }
+        }
     }
-}
 
-fn spec_view(title: &str, im: image::Handle, width: u16, height: u16) -> Element<Message> {
-    column![
-        text(title).size(24).width(Length::Fill),
-        spec_raw(im, width, height)
-    ]
-    .max_width(width)
-    .width(Length::Fill)
-    .into()
-}
-fn spec_raw<'a>(im: image::Handle, width: u16, height: u16) -> Container<'a, Message> {
-    container(
-        Image::new(im)
-            .width(width)
-            .height(height)
-            .content_fit(ContentFit::Fill),
-    )
-    .max_width(width)
-    .max_height(height)
-    .width(Length::Fill)
-    .center_x()
-    .center_y()
-}
+    fn handle_device_lost(&mut self, event: DeviceEvent) {
+        log::warn!("Audio device lost during capture, resetting UI and refreshing devices.");
+        self.df_worker = None;
+        self.spec_noisy = None;
+        self.spec_enh = None;
+        self.noisy_texture = None;
+        self.enh_texture = None;
+        self.refresh_devices();
+        match event {
+            DeviceEvent::InputLost => {
+                self.input_device = match find_cable() {
+                    Ok(name) => {
+                        log::info!("Auto-selected input device: {name}");
+                        Some(name)
+                    }
+                    Err(e) => {
+                        log::warn!("Could not auto-select input device: {e}");
+                        None
+                    }
+                };
+            }
+            DeviceEvent::OutputLost => {
+                self.output_device = match set_output_device() {
+                    Ok(name) => {
+                        log::info!("Auto-selected output device: {name}");
+                        Some(name)
+                    }
+                    Err(e) => {
+                        log::warn!("Could not auto-select output device: {e}");
+                        None
+                    }
+                };
+            }
+        }
+    }
 
-#[allow(clippy::too_many_arguments)]
-fn slider_view<'a>(
-    title: &str,
-    value: f32,
-    min: f32,
-    max: f32,
-    message: impl Fn(f32) -> Message + 'a,
-    width: u16,
-    precision: usize,
-    step: f32,
-) -> Element<'a, Message> {
-    column![
-        text(title).size(18).width(Length::Fill),
-        row![
-            container(slider(min..=max, value, message).step(step)).width(Length::Fill),
-            text(format!("{:.precision$}", value))
-                .size(18)
-                .width(100)
-                .horizontal_alignment(alignment::Horizontal::Right)
-                .vertical_alignment(alignment::Vertical::Top),
-        ]
-    ]
-    .max_width(width)
-    .width(Length::Fill)
-    .into()
-}
-
-fn button(text: &str) -> widget::Button<'_, Message> {
-    widget::button(text).padding(10)
-}
-
-impl LiveMusicRemover {
     fn start_capture(&mut self, input_device: Option<String>, output_device: Option<String>) {
         let (s_lsnr, r_lsnr) = unbounded();
         let (s_noisy, r_noisy) = unbounded();
@@ -807,18 +343,10 @@ impl LiveMusicRemover {
                 let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
                 let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
                 let h = (8000 / freq_res) as u32;
-                let (noisy_img, enh_img) = unsafe {
-                    SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-                    SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-                    (
-                        SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
-                        SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
-                    )
-                };
 
+                self.spec_noisy = Some(SpecImage::new(w, h, -100., -10.));
+                self.spec_enh = Some(SpecImage::new(w, h, -100., -10.));
                 self.df_worker = Some(df_worker);
-                self.noisy_img = Some(noisy_img);
-                self.enh_img = Some(enh_img);
                 self.r_lsnr = r_lsnr;
                 self.r_noisy = r_noisy;
                 self.r_enh = r_enh;
@@ -829,7 +357,6 @@ impl LiveMusicRemover {
                 log::error!("Failed to initialize DeepFilterNet audio capturing: {}", e);
                 self.df_worker = None;
                 self.refresh_devices();
-                // Only auto-select the relevant device based on error
                 if let Some(dev_err) = e.downcast_ref::<capture::DeviceSelectError>() {
                     match dev_err {
                         capture::DeviceSelectError::InputNotFound(_)
@@ -863,20 +390,10 @@ impl LiveMusicRemover {
             log::error!("Failed to get input devices: {}", e);
             vec![]
         });
-
         self.available_output_devices = get_output_devices().unwrap_or_else(|e| {
             log::error!("Failed to get output devices: {}", e);
             vec![]
         });
-
-        // // check if the selected input and output devices still exist, otherwise auto-select them
-        // if !self::device_exists(self.input_device, self.available_input_devices) {
-        //     self.auto_select_input_device();
-        // }
-
-        // if !self::device_exists(self.output_device, self.available_output_devices) {
-        //     self.auto_select_output_device();
-        // }
     }
 
     fn auto_select_input_device(&mut self) {
@@ -903,5 +420,239 @@ impl LiveMusicRemover {
                 None
             }
         };
+    }
+}
+
+impl eframe::App for LiveMusicRemover {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll channels for new data
+        self.poll_channels(ctx);
+
+        // Request repaint at 20ms intervals for real-time updates
+        ctx.request_repaint_after(Duration::from_millis(20));
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Title bar row
+            ui.horizontal(|ui| {
+                ui.heading("Live Music Remover");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Exit").clicked() {
+                        if let Some(worker) = self.df_worker.as_mut() {
+                            worker.should_stop().ok();
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            });
+
+            ui.separator();
+
+            // Device selection
+            let selected_input = self.input_device.clone().unwrap_or_default();
+            let input_devices = self.available_input_devices.clone();
+            let current_input = self.input_device.clone();
+            egui::ComboBox::from_label("Input device")
+                .selected_text(&selected_input)
+                .show_ui(ui, |ui| {
+                    for device in &input_devices {
+                        let is_selected = current_input.as_deref() == Some(device.as_str());
+                        if ui.selectable_label(is_selected, device).clicked() {
+                            let device = device.clone();
+                            self.refresh_devices();
+                            if self.df_worker.is_some() {
+                                self.stop_capture();
+                                self.spec_noisy = None;
+                                self.spec_enh = None;
+                                self.noisy_texture = None;
+                                self.enh_texture = None;
+                                if device_exists(
+                                    Some(device.as_str()),
+                                    &self.available_input_devices,
+                                ) {
+                                    self.input_device = Some(device);
+                                } else {
+                                    self.auto_select_input_device();
+                                }
+                                let inp = self.input_device.clone();
+                                let out = self.output_device.clone();
+                                self.start_capture(inp, out);
+                            } else if device_exists(
+                                Some(device.as_str()),
+                                &self.available_input_devices,
+                            ) {
+                                self.input_device = Some(device);
+                            } else {
+                                self.auto_select_input_device();
+                            }
+                        }
+                    }
+                });
+
+            let selected_output = self.output_device.clone().unwrap_or_default();
+            let output_devices = self.available_output_devices.clone();
+            let current_output = self.output_device.clone();
+            egui::ComboBox::from_label("Output device")
+                .selected_text(&selected_output)
+                .show_ui(ui, |ui| {
+                    for device in &output_devices {
+                        let is_selected = current_output.as_deref() == Some(device.as_str());
+                        if ui.selectable_label(is_selected, device).clicked() {
+                            let device = device.clone();
+                            self.refresh_devices();
+                            if self.df_worker.is_some() {
+                                self.stop_capture();
+                                self.spec_noisy = None;
+                                self.spec_enh = None;
+                                self.noisy_texture = None;
+                                self.enh_texture = None;
+                                if device_exists(
+                                    Some(device.as_str()),
+                                    &self.available_output_devices,
+                                ) {
+                                    self.output_device = Some(device);
+                                } else {
+                                    self.auto_select_output_device();
+                                }
+                                let inp = self.input_device.clone();
+                                let out = self.output_device.clone();
+                                self.start_capture(inp, out);
+                            } else if device_exists(
+                                Some(device.as_str()),
+                                &self.available_output_devices,
+                            ) {
+                                self.output_device = Some(device);
+                            } else {
+                                self.auto_select_output_device();
+                            }
+                        }
+                    }
+                });
+
+            if ui.button("Refresh Devices").clicked() {
+                self.refresh_devices();
+                if !device_exists(self.input_device.as_deref(), &self.available_input_devices) {
+                    self.auto_select_input_device();
+                }
+                if !device_exists(
+                    self.output_device.as_deref(),
+                    &self.available_output_devices,
+                ) {
+                    self.auto_select_output_device();
+                }
+            }
+
+            ui.separator();
+
+            // Start / Stop buttons
+            let start_enabled = self.df_worker.is_none()
+                && self.input_device.is_some()
+                && self.output_device.is_some();
+            let stop_enabled = self.df_worker.is_some();
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(start_enabled, egui::Button::new("Start"))
+                    .clicked()
+                {
+                    let inp = self.input_device.clone();
+                    let out = self.output_device.clone();
+                    self.start_capture(inp, out);
+                }
+                if ui
+                    .add_enabled(stop_enabled, egui::Button::new("Stop"))
+                    .clicked()
+                {
+                    self.stop_capture();
+                    self.spec_noisy = None;
+                    self.spec_enh = None;
+                    self.noisy_texture = None;
+                    self.enh_texture = None;
+                }
+                if self.df_worker.is_none() && !start_enabled {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 60, 60),
+                        "Select input and output devices to start.",
+                    );
+                }
+            });
+
+            ui.separator();
+
+            // Sliders
+            #[cfg(feature = "thresholds")]
+            {
+                ui.label("Threshold Min [dB]");
+                if ui
+                    .add(egui::Slider::new(&mut self.min_threshdb, -15.0..=35.0).step_by(1.0))
+                    .changed()
+                {
+                    self.s_controls
+                        .send((DfControl::MinThreshDb, self.min_threshdb))
+                        .ok();
+                }
+
+                ui.label("Threshold ERB Max [dB]");
+                if ui
+                    .add(egui::Slider::new(&mut self.max_erbthreshdb, -15.0..=35.0).step_by(1.0))
+                    .changed()
+                {
+                    self.s_controls
+                        .send((DfControl::MaxErbThreshDb, self.max_erbthreshdb))
+                        .ok();
+                }
+
+                ui.label("Threshold DF Max [dB]");
+                if ui
+                    .add(egui::Slider::new(&mut self.max_dfthreshdb, -15.0..=35.0).step_by(1.0))
+                    .changed()
+                {
+                    self.s_controls
+                        .send((DfControl::MaxDfThreshDb, self.max_dfthreshdb))
+                        .ok();
+                }
+            }
+
+            ui.label("Noise Attenuation [dB]");
+            if ui
+                .add(egui::Slider::new(&mut self.atten_lim, 0.0..=100.0))
+                .changed()
+            {
+                self.s_controls
+                    .send((DfControl::AttenLim, self.atten_lim))
+                    .ok();
+            }
+
+            ui.label("Post Filter Beta");
+            if ui
+                .add(egui::Slider::new(&mut self.post_filter_beta, 0.0..=1.0).step_by(0.001))
+                .changed()
+            {
+                self.s_controls
+                    .send((DfControl::PostFilterBeta, self.post_filter_beta))
+                    .ok();
+            }
+
+            ui.separator();
+
+            // Spectrograms
+            if self.df_worker.is_some() {
+                if let Some(ref texture) = self.noisy_texture {
+                    ui.label("Noisy");
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(1000.0, 250.0)));
+                }
+                if let Some(ref texture) = self.enh_texture {
+                    ui.label("DeepFilterNet Enhanced");
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(1000.0, 250.0)));
+                }
+            }
+
+            ui.separator();
+
+            // SNR display
+            ui.horizontal(|ui| {
+                ui.label("Current SNR:");
+                ui.label(format!("{:>5.1} dB", self.lsnr));
+            });
+        });
     }
 }
