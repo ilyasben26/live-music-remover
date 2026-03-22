@@ -56,3 +56,12 @@ pub fn set_output_device() -> Result<String> {
 
     bail!("Could not pick an output device.")
 }
+
+pub fn device_exists(device: Option<&str>, device_list: &[String]) -> bool {
+    match device {
+        Some(needle) => device_list
+            .iter()
+            .any(|d| d.to_lowercase() == needle.to_lowercase()),
+        None => false,
+    }
+}

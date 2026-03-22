@@ -2052,6 +2052,7 @@ dependencies = [
  "ndarray",
  "ringbuf",
  "rubato 0.15.0",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

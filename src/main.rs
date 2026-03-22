@@ -12,7 +12,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use clap::{Parser, ValueHint};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
 use iced::widget::{
     self, column, container, image, pick_list, row, slider, text, Container, Image,
 };
@@ -27,7 +27,9 @@ mod cmap;
 mod devices;
 use capture::*;
 
-use crate::devices::{find_cable, get_input_devices, get_output_devices, set_output_device};
+use crate::devices::{
+    device_exists, find_cable, get_input_devices, get_output_devices, set_output_device,
+};
 
 /// Simple program to sample from a hd5 dataset directory
 #[derive(Parser)]
@@ -108,6 +110,7 @@ struct LiveMusicRemover {
     output_device: Option<String>,
     available_input_devices: Vec<String>,
     available_output_devices: Vec<String>,
+    r_device_event: Option<Receiver<DeviceEvent>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +139,9 @@ pub enum Message {
     StopCapture,
     InputDeviceSelected(String),
     OutputDeviceSelected(String),
+    RefreshDevices,
     Tick,
+    DeviceLost(DeviceEvent),
     LsnrChanged(f32),
     NoisyChanged,
     EnhChanged,
@@ -212,6 +217,7 @@ impl Application for LiveMusicRemover {
         let (s_noisy, r_noisy) = unbounded();
         let (s_enh, r_enh) = unbounded();
         let (s_controls, r_controls) = unbounded();
+        let (s_device_event, r_device_event) = unbounded();
 
         // get devices
         let available_input_devices = get_input_devices().unwrap_or_else(|e| {
@@ -270,6 +276,7 @@ impl Application for LiveMusicRemover {
                 output_device,
                 available_input_devices: available_input_devices,
                 available_output_devices: available_output_devices,
+                r_device_event: Some(r_device_event),
             },
             Command::none(),
         )
@@ -291,21 +298,84 @@ impl Application for LiveMusicRemover {
                 self.start_capture(self.input_device.clone(), self.output_device.clone());
             }
             Message::StopCapture => {
-                if let Some(worker) = self.df_worker.as_mut() {
-                    log::info!("Stopping cleaning ...");
-                    worker.should_stop().expect("Failed to stop DF worker");
-                }
-                self.df_worker = None;
+                self.stop_capture();
                 self.noisy_img = None;
                 self.enh_img = None;
             }
             Message::InputDeviceSelected(device) => {
                 log::info!("Selected input device: {:?}", device);
-                self.input_device = Some(device);
+                self.refresh_devices();
+                if self.df_worker.is_some() {
+                    // if capture is running update the device on the fly
+                    if device_exists(Some(device.as_str()), &self.available_input_devices) {
+                        self.stop_capture();
+                        self.noisy_img = None;
+                        self.enh_img = None;
+
+                        self.input_device = Some(device);
+
+                        self.start_capture(self.input_device.clone(), self.output_device.clone());
+                    } else {
+                        self.stop_capture();
+                        self.noisy_img = None;
+                        self.enh_img = None;
+
+                        self.auto_select_input_device();
+                        self.start_capture(self.input_device.clone(), self.output_device.clone());
+                    }
+                } else {
+                    // if capture is not running
+                    if device_exists(Some(device.as_str()), &self.available_input_devices) {
+                        self.input_device = Some(device);
+                    } else {
+                        self.auto_select_input_device();
+                    }
+                }
             }
             Message::OutputDeviceSelected(device) => {
                 log::info!("Selected output device: {:?}", device);
-                self.output_device = Some(device);
+                self.refresh_devices();
+                if self.df_worker.is_some() {
+                    // if capture is running update the device on the fly
+                    if device_exists(Some(device.as_str()), &self.available_output_devices) {
+                        self.stop_capture();
+                        self.noisy_img = None;
+                        self.enh_img = None;
+
+                        self.output_device = Some(device);
+
+                        self.start_capture(self.input_device.clone(), self.output_device.clone());
+                    } else {
+                        self.stop_capture();
+                        self.noisy_img = None;
+                        self.enh_img = None;
+
+                        self.auto_select_output_device();
+                        self.start_capture(self.input_device.clone(), self.output_device.clone());
+                    }
+                } else {
+                    // if capture is not running
+                    if device_exists(Some(device.as_str()), &self.available_output_devices) {
+                        self.output_device = Some(device);
+                    } else {
+                        self.auto_select_output_device();
+                    }
+                }
+            }
+            Message::RefreshDevices => {
+                self.refresh_devices();
+
+                // check if the selected input and output devices still exist, otherwise auto-select them
+                if !device_exists(self.input_device.as_deref(), &self.available_input_devices) {
+                    self.auto_select_input_device();
+                }
+
+                if !device_exists(
+                    self.output_device.as_deref(),
+                    &self.available_output_devices,
+                ) {
+                    self.auto_select_output_device();
+                }
             }
             Message::Exit => {
                 if let Some(worker) = self.df_worker.as_mut() {
@@ -324,7 +394,56 @@ impl Application for LiveMusicRemover {
                 if let Some(task) = self.update_enh() {
                     commands.push(Command::perform(task, move |message| message))
                 }
+                if let Some(ref r_device_event) = self.r_device_event {
+                    if !r_device_event.is_empty() {
+                        if let Ok(event) = r_device_event.try_recv() {
+                            commands.push(Command::perform(
+                                async { Message::DeviceLost(event) },
+                                |m| m,
+                            ));
+                        }
+                    }
+                }
                 return Command::batch(commands);
+            }
+            Message::DeviceLost(event) => {
+                log::warn!(
+                    "Audio device lost during capture, resetting UI and refreshing devices."
+                );
+
+                self.df_worker = None;
+                self.noisy_img = None;
+                self.enh_img = None;
+                self.refresh_devices();
+
+                match event {
+                    DeviceEvent::InputLost => {
+                        // auto-select input device
+                        self.input_device = match find_cable() {
+                            Ok(name) => {
+                                log::info!("Auto-selected input device: {name}");
+                                Some(name)
+                            }
+                            Err(e) => {
+                                log::warn!("Could not auto-select input device: {e}");
+                                None
+                            }
+                        };
+                    }
+                    DeviceEvent::OutputLost => {
+                        // auto-select output device
+                        self.output_device = match set_output_device() {
+                            Ok(name) => {
+                                log::info!("Auto-selected output device: {name}");
+                                Some(name)
+                            }
+                            Err(e) => {
+                                log::warn!("Could not auto-select output device: {e}");
+                                None
+                            }
+                        };
+                    }
+                }
             }
             Message::LsnrChanged(lsnr) => self.lsnr = lsnr,
             Message::NoisyChanged => {
@@ -483,6 +602,7 @@ impl Application for LiveMusicRemover {
                 self.output_device.clone(),
                 Message::OutputDeviceSelected,
             ))
+            .push(button("Refresh Devices").on_press(Message::RefreshDevices))
             .push(start_row)
             .push(stop_button)
             // .push(pick_list(fruits, self.fruit_test, Message::FruitSelected))
@@ -669,10 +789,11 @@ impl LiveMusicRemover {
         let (s_noisy, r_noisy) = unbounded();
         let (s_enh, r_enh) = unbounded();
         let (s_controls, r_controls) = unbounded();
+        let (s_device_event, r_device_event) = unbounded();
 
         let model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
         log::info!("Using model path: {:?}", model_path);
-        let df_worker = DeepFilterCapture::new(
+        match DeepFilterCapture::new(
             model_path,
             input_device,
             output_device,
@@ -680,27 +801,107 @@ impl LiveMusicRemover {
             Some(s_noisy),
             Some(s_enh),
             Some(r_controls),
-        )
-        .expect("Failed to initialize DeepFilterNet audio capturing");
+            Some(s_device_event),
+        ) {
+            Ok(df_worker) => {
+                let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
+                let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
+                let h = (8000 / freq_res) as u32;
+                let (noisy_img, enh_img) = unsafe {
+                    SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
+                    SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
+                    (
+                        SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
+                        SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
+                    )
+                };
 
-        let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
-        let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
-        let h = (8000 / freq_res) as u32;
-        let (noisy_img, enh_img) = unsafe {
-            SPEC_NOISY = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-            SPEC_ENH = Some(Arc::new(Mutex::new(SpecImage::new(w, h, -100., -10.))));
-            (
-                SPEC_NOISY.as_ref().unwrap().lock().unwrap().image_handle(),
-                SPEC_ENH.as_ref().unwrap().lock().unwrap().image_handle(),
-            )
+                self.df_worker = Some(df_worker);
+                self.noisy_img = Some(noisy_img);
+                self.enh_img = Some(enh_img);
+                self.r_lsnr = r_lsnr;
+                self.r_noisy = r_noisy;
+                self.r_enh = r_enh;
+                self.s_controls = s_controls;
+                self.r_device_event = Some(r_device_event);
+            }
+            Err(e) => {
+                log::error!("Failed to initialize DeepFilterNet audio capturing: {}", e);
+                self.df_worker = None;
+                self.refresh_devices();
+                // Only auto-select the relevant device based on error
+                if let Some(dev_err) = e.downcast_ref::<capture::DeviceSelectError>() {
+                    match dev_err {
+                        capture::DeviceSelectError::InputNotFound(_)
+                        | capture::DeviceSelectError::NoInputProvided => {
+                            log::debug!("Input device not found/provided");
+                            self.auto_select_input_device();
+                        }
+                        capture::DeviceSelectError::OutputNotFound(_)
+                        | capture::DeviceSelectError::NoOutputProvided => {
+                            log::debug!("Output device not found/provided");
+                            self.auto_select_output_device();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn stop_capture(&mut self) {
+        if let Some(worker) = self.df_worker.as_mut() {
+            log::info!("Stopping cleaning ...");
+            worker.should_stop().expect("Failed to stop DF worker");
+        }
+        self.df_worker = None;
+    }
+
+    fn refresh_devices(&mut self) {
+        log::info!("Refreshing devices...");
+        self.available_input_devices = get_input_devices().unwrap_or_else(|e| {
+            log::error!("Failed to get input devices: {}", e);
+            vec![]
+        });
+
+        self.available_output_devices = get_output_devices().unwrap_or_else(|e| {
+            log::error!("Failed to get output devices: {}", e);
+            vec![]
+        });
+
+        // // check if the selected input and output devices still exist, otherwise auto-select them
+        // if !self::device_exists(self.input_device, self.available_input_devices) {
+        //     self.auto_select_input_device();
+        // }
+
+        // if !self::device_exists(self.output_device, self.available_output_devices) {
+        //     self.auto_select_output_device();
+        // }
+    }
+
+    fn auto_select_input_device(&mut self) {
+        self.input_device = match find_cable() {
+            Ok(name) => {
+                log::info!("Auto-selected input device: {name}");
+                Some(name)
+            }
+            Err(e) => {
+                log::warn!("Could not auto-select input device: {e}");
+                None
+            }
         };
+    }
 
-        self.df_worker = Some(df_worker);
-        self.noisy_img = Some(noisy_img);
-        self.enh_img = Some(enh_img);
-        self.r_lsnr = r_lsnr;
-        self.r_noisy = r_noisy;
-        self.r_enh = r_enh;
-        self.s_controls = s_controls;
+    fn auto_select_output_device(&mut self) {
+        self.output_device = match set_output_device() {
+            Ok(name) => {
+                log::info!("Auto-selected output device: {name}");
+                Some(name)
+            }
+            Err(e) => {
+                log::warn!("Could not auto-select output device: {e}");
+                None
+            }
+        };
     }
 }

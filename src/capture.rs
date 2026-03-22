@@ -1,3 +1,17 @@
+use thiserror::Error;
+#[derive(Debug, Error)]
+pub enum DeviceSelectError {
+    #[error("Requested input device '{0}' not found")]
+    InputNotFound(String),
+    #[error("Requested output device '{0}' not found")]
+    OutputNotFound(String),
+    #[error("No input device string provided")]
+    NoInputProvided,
+    #[error("No output device string provided")]
+    NoOutputProvided,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 use std::env;
 use std::fmt::Display;
 use std::io::{self, stdout, Write};
@@ -19,6 +33,12 @@ use ndarray::prelude::*;
 use ringbuf::{producer::PostponedProducer, Consumer, HeapRb, SharedRb};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
 
+#[derive(Debug, Clone)]
+pub enum DeviceEvent {
+    InputLost,
+    OutputLost,
+}
+
 pub type RbProd = PostponedProducer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
 pub type RbCons = Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>;
 pub type SendLsnr = Sender<f32>;
@@ -27,6 +47,8 @@ pub type SendSpec = Sender<Box<[f32]>>;
 pub type RecvSpec = Receiver<Box<[f32]>>;
 pub type SendControl = Sender<(DfControl, f32)>;
 pub type RecvControl = Receiver<(DfControl, f32)>;
+pub type SendDeviceEvent = Sender<DeviceEvent>;
+pub type RecvDeviceEvent = Receiver<DeviceEvent>;
 
 pub(crate) static INIT_LOGGER: Once = Once::new();
 pub(crate) static mut MODEL_PATH: Option<PathBuf> = None;
@@ -39,11 +61,13 @@ pub struct AudioSink {
     stream: Option<Stream>,
     config: StreamConfig,
     device: Device,
+    device_event: Option<SendDeviceEvent>,
 }
 pub struct AudioSource {
     stream: Option<Stream>,
     config: StreamConfig,
     device: Device,
+    device_event: Option<SendDeviceEvent>,
 }
 
 #[derive(PartialEq)]
@@ -204,36 +228,69 @@ fn planar_to_interleaved(input: &[f32], channels: usize, output: &mut [f32]) {
 }
 
 impl AudioSink {
-    fn new(sample_rate: u32, device_str: Option<String>) -> Result<Self> {
+    fn new(
+        sample_rate: u32,
+        device_str: Option<String>,
+        device_event: Option<SendDeviceEvent>,
+    ) -> std::result::Result<Self, DeviceSelectError> {
         let host = cpal::default_host();
-        let mut device = host
-            .default_output_device()
-            .expect("no output device available");
-        if let Some(device_str) = device_str {
-            for avail_dev in host.output_devices()? {
+        let device = if let Some(device_str) = device_str {
+            let mut found = None;
+            for avail_dev in host
+                .output_devices()
+                .map_err(|e| DeviceSelectError::Other(e.into()))?
+            {
                 if avail_dev
-                    .name()?
+                    .name()
+                    .map_err(|e| DeviceSelectError::Other(e.into()))?
                     .to_lowercase()
                     .contains(&device_str.to_lowercase())
                 {
-                    device = avail_dev
+                    found = Some(avail_dev);
+                    break;
                 }
             }
-        }
-        let config = get_stream_config(&device, sample_rate, StreamDirection::Output)
-            .expect("No suitable audio output config found.");
+            if let Some(dev) = found {
+                dev
+            } else {
+                log::error!("Requested output device '{}' not found", device_str);
+                return Err(DeviceSelectError::OutputNotFound(device_str));
+            }
+        } else {
+            log::error!("No output device string provided");
+            return Err(DeviceSelectError::NoOutputProvided);
+        };
 
-        log::info!("selected sink/output device: {}", device.name()?);
+        let config =
+            get_stream_config(&device, sample_rate, StreamDirection::Output).ok_or_else(|| {
+                DeviceSelectError::Other(anyhow::anyhow!("No suitable audio output config found."))
+            })?;
+
+        log::info!(
+            "selected sink/output device: {}",
+            device
+                .name()
+                .map_err(|e| DeviceSelectError::Other(e.into()))?
+        );
         log::info!("Selected sink/output config: {:?}", config);
 
         Ok(Self {
             stream: None,
             config,
             device,
+            device_event,
         })
     }
-    fn start(&mut self, mut rb: RbCons, model_ch: usize) -> Result<()> {
+
+    fn start(
+        &mut self,
+        mut rb: RbCons,
+        model_ch: usize,
+        device_lost: Arc<AtomicBool>,
+    ) -> Result<()> {
         let output_ch = self.config.channels as usize;
+        let device_lost_cb = device_lost.clone();
+        let device_event = self.device_event.clone();
         let stream = self.device.build_output_stream(
             &self.config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -261,7 +318,16 @@ impl AudioSink {
                     );
                 }
             },
-            move |err| log::error!("Error during audio output {:?}", err),
+            move |err| {
+                log::error!("Error during audio output {:?}", err);
+                if let cpal::StreamError::DeviceNotAvailable = err {
+                    device_lost_cb.store(true, Ordering::Relaxed);
+                    log::error!("Audio output device lost, stopping stream.");
+                    if let Some(ref sender) = device_event {
+                        let _ = sender.send(DeviceEvent::OutputLost);
+                    }
+                }
+            },
             None, // None=blocking, Some(Duration)=timeout
         )?;
         stream.play()?;
@@ -281,36 +347,68 @@ impl AudioSink {
 }
 
 impl AudioSource {
-    fn new(sample_rate: u32, device_str: Option<String>) -> Result<Self> {
+    fn new(
+        sample_rate: u32,
+        device_str: Option<String>,
+        device_event: Option<SendDeviceEvent>,
+    ) -> std::result::Result<Self, DeviceSelectError> {
         let host = cpal::default_host();
-        let mut device = host
-            .default_input_device()
-            .expect("no output device available");
-        if let Some(device_str) = device_str {
-            for avail_dev in host.input_devices()? {
+        let device = if let Some(device_str) = device_str {
+            let mut found = None;
+            for avail_dev in host
+                .input_devices()
+                .map_err(|e| DeviceSelectError::Other(e.into()))?
+            {
                 if avail_dev
-                    .name()?
+                    .name()
+                    .map_err(|e| DeviceSelectError::Other(e.into()))?
                     .to_lowercase()
                     .contains(&device_str.to_lowercase())
                 {
-                    device = avail_dev
+                    found = Some(avail_dev);
+                    break;
                 }
             }
-        }
-        let config = get_stream_config(&device, sample_rate, StreamDirection::Input)
-            .expect("No suitable audio input config found.");
+            if let Some(dev) = found {
+                dev
+            } else {
+                log::error!("Requested input device '{}' not found", device_str);
+                return Err(DeviceSelectError::InputNotFound(device_str));
+            }
+        } else {
+            log::error!("No input device string provided");
+            return Err(DeviceSelectError::NoInputProvided);
+        };
 
-        log::info!("Selected source/input device: {}", device.name()?);
+        let config =
+            get_stream_config(&device, sample_rate, StreamDirection::Input).ok_or_else(|| {
+                DeviceSelectError::Other(anyhow::anyhow!("No suitable audio input config found."))
+            })?;
+
+        log::info!(
+            "Selected source/input device: {}",
+            device
+                .name()
+                .map_err(|e| DeviceSelectError::Other(e.into()))?
+        );
         log::info!("Selected source/input config: {:?}", config);
 
         Ok(Self {
             stream: None,
             config,
             device,
+            device_event,
         })
     }
-    fn start(&mut self, mut rb: RbProd, model_ch: usize) -> Result<()> {
+    fn start(
+        &mut self,
+        mut rb: RbProd,
+        model_ch: usize,
+        device_lost: Arc<AtomicBool>,
+    ) -> Result<()> {
         let input_ch = self.config.channels as usize;
+        let device_lost_cb = device_lost.clone();
+        let device_event = self.device_event.clone();
         let stream = self.device.build_input_stream(
             &self.config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -339,7 +437,16 @@ impl AudioSource {
                 }
                 rb.sync();
             },
-            move |err| log::error!("Error during audio output {:?}", err),
+            move |err| {
+                log::error!("Error during audio input {:?}", err);
+                if let cpal::StreamError::DeviceNotAvailable = err {
+                    device_lost_cb.store(true, Ordering::Relaxed);
+                    log::error!("Audio input device lost, stopping stream.");
+                    if let Some(ref sender) = device_event {
+                        let _ = sender.send(DeviceEvent::InputLost);
+                    }
+                }
+            },
             None, // None=blocking, Some(Duration)=timeout
         )?;
         log::info!("Starting capture stream on device {}", self.device.name()?);
@@ -361,10 +468,11 @@ impl AudioSource {
 pub(crate) struct AtomicControls {
     has_init: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
+    device_lost: Arc<AtomicBool>,
 }
 impl AtomicControls {
-    pub fn into_inner(self) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
-        (self.has_init, self.should_stop)
+    pub fn into_inner(self) -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        (self.has_init, self.should_stop, self.device_lost)
     }
 }
 pub(crate) struct GuiCom {
@@ -392,7 +500,7 @@ fn get_worker_fn(
     controls: AtomicControls,
     df_com: Option<GuiCom>,
 ) -> impl FnMut() {
-    let (has_init, should_stop) = controls.into_inner();
+    let (has_init, should_stop, device_lost) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
         df_com.into_inner()
     } else {
@@ -428,7 +536,7 @@ fn get_worker_fn(
         let mut interleaved_in = vec![0.0; n_in * ch];
         let mut interleaved_out = vec![0.0; n_out * ch];
         let mut resampled_in = vec![vec![0.0; df.hop_size]; ch];
-        while !should_stop.load(Ordering::Relaxed) {
+        while !should_stop.load(Ordering::Relaxed) && !device_lost.load(Ordering::Relaxed) {
             if rb_in.len() < n_in * ch {
                 // Sleep for half a hop size
                 sleep(Duration::from_secs_f32(
@@ -550,7 +658,7 @@ pub struct DeepFilterCapture {
 
 impl Default for DeepFilterCapture {
     fn default() -> Self {
-        DeepFilterCapture::new(None, None, None, None, None, None, None)
+        DeepFilterCapture::new(None, None, None, None, None, None, None, None)
             .expect("Error during DeepFilterCapture initialization")
     }
 }
@@ -563,6 +671,7 @@ impl DeepFilterCapture {
         s_noisy: Option<SendSpec>,
         s_enh: Option<SendSpec>,
         r_opt: Option<RecvControl>,
+        s_device_event: Option<SendDeviceEvent>,
     ) -> Result<Self> {
         let ch = PROCESS_CHANNELS;
         let (sr, frame_size, freq_size) = init_df(model_path, ch);
@@ -579,10 +688,11 @@ impl DeepFilterCapture {
         log::debug!("input_device: {:?}", input_device);
         log::debug!("output_device: {:?}", output_device);
 
-        let mut source = AudioSource::new(sr as u32, input_device)?;
-        let mut sink = AudioSink::new(sr as u32, output_device)?;
+        let mut source = AudioSource::new(sr as u32, input_device, s_device_event.clone())?;
+        let mut sink = AudioSink::new(sr as u32, output_device, s_device_event.clone())?;
         let should_stop = Arc::new(AtomicBool::new(false));
         let has_init = Arc::new(AtomicBool::new(false));
+        let device_lost = Arc::new(AtomicBool::new(false));
         let s_spec = match (s_noisy, s_enh) {
             (Some(n), Some(e)) => Some((n, e)),
             _ => None,
@@ -590,6 +700,7 @@ impl DeepFilterCapture {
         let controls = AtomicControls {
             has_init: has_init.clone(),
             should_stop: should_stop.clone(),
+            device_lost: device_lost.clone(),
         };
         let df_com = GuiCom {
             s_lsnr,
@@ -608,8 +719,8 @@ impl DeepFilterCapture {
             sleep(Duration::from_secs_f32(0.01));
         }
         log::info!("DeepFilter Capture init");
-        source.start(in_prod, ch)?;
-        sink.start(out_cons, ch)?;
+        source.start(in_prod, ch, device_lost.clone())?;
+        sink.start(out_cons, ch, device_lost.clone())?;
 
         Ok(Self {
             sr,
@@ -623,12 +734,13 @@ impl DeepFilterCapture {
     }
 
     pub fn should_stop(&mut self) -> Result<()> {
-        self.sink.pause()?;
-        self.source.pause()?;
+        // Try to pause, but ignore errors if device is already lost
+        let _ = self.sink.pause();
+        let _ = self.source.pause();
         if let Some(h) = self.worker_handle.take() {
             log::info!("Joining DF Worker");
             self.should_stop.swap(true, Ordering::Relaxed);
-            h.join().expect("Error during DF worker join");
+            let _ = h.join();
         }
         Ok(())
     }
