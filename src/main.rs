@@ -82,7 +82,6 @@ pub fn main() -> eframe::Result<()> {
         "Live Music Remover",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             cc.egui_ctx.set_zoom_factor(1.2);
             Ok(Box::new(LiveMusicRemover::new()))
         }),
@@ -115,6 +114,8 @@ struct LiveMusicRemover {
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
     selected_model: ModelKind,
+    dark_mode: bool,
+    last_dark_mode: bool,
 }
 
 struct SpecImage {
@@ -161,17 +162,33 @@ impl SpecImage {
         let (w, h) = (self.w(), self.h());
         self.im.rotate_left((w - n_specs) * 4 * h);
     }
-    fn to_color_image(&self) -> egui::ColorImage {
+    fn to_color_image(&self, dark_mode: bool) -> egui::ColorImage {
         // Time on x-axis (left=old, right=new), frequency on y-axis (top=high, bottom=low)
         let nf = self.n_freqs as usize;
         let nt = self.n_frames as usize;
-        let mut pixels = vec![egui::Color32::BLACK; nf * nt];
+        let bg = if dark_mode {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::from_rgba_unmultiplied(220, 220, 220, 255)
+        };
+        let mut pixels = vec![bg; nf * nt];
         for (t, row) in self.im.rows().enumerate() {
             for (f, p) in row.enumerate() {
                 let out_x = t; // time: left=old, right=new
                 let out_y = nf - 1 - f; // frequency: top=high, bottom=low
-                pixels[out_y * nt + out_x] =
-                    egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
+                if p[3] > 0 {
+                    let color = if dark_mode {
+                        egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(
+                            220 - p[0],
+                            220 - p[1],
+                            220 - p[2],
+                            p[3],
+                        )
+                    };
+                    pixels[out_y * nt + out_x] = color;
+                }
             }
         }
         egui::ColorImage {
@@ -265,6 +282,8 @@ impl LiveMusicRemover {
             system_volume: 1.0,
             freq_axis_scale: 1.5,
             selected_model: ModelKind::default(),
+            dark_mode: true,
+            last_dark_mode: true,
         }
     }
 
@@ -293,7 +312,7 @@ impl LiveMusicRemover {
                 spec.update(specs.into_iter(), n);
                 self.noisy_texture = Some(ctx.load_texture(
                     "noisy_spec",
-                    spec.to_color_image(),
+                    spec.to_color_image(self.dark_mode),
                     egui::TextureOptions::LINEAR,
                 ));
             }
@@ -307,7 +326,7 @@ impl LiveMusicRemover {
                 spec.update(specs.into_iter(), n);
                 self.enh_texture = Some(ctx.load_texture(
                     "enh_spec",
-                    spec.to_color_image(),
+                    spec.to_color_image(self.dark_mode),
                     egui::TextureOptions::LINEAR,
                 ));
             }
@@ -467,13 +486,17 @@ fn show_snr_gauge(ui: &mut egui::Ui, lsnr: f32) {
     let gauge_w = 28.0;
     let gauge_h = 100.0;
 
+    let bg_color = ui.visuals().extreme_bg_color;
+    let border_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let tick_color = ui.visuals().text_color();
+
     ui.vertical(|ui| {
         ui.label(egui::RichText::new("SNR").small());
         let (rect, _) = ui.allocate_exact_size(egui::vec2(gauge_w, gauge_h), egui::Sense::hover());
         let painter = ui.painter();
 
         // Background
-        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(35, 35, 35));
+        painter.rect_filled(rect, 3.0, bg_color);
 
         // Fill bar (grows upward)
         if fill_frac > 0.0 {
@@ -493,16 +516,11 @@ fn show_snr_gauge(ui: &mut egui::Ui, lsnr: f32) {
                 egui::pos2(rect.min.x, tick_y),
                 egui::pos2(rect.max.x, tick_y),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)),
+            egui::Stroke::new(1.0, tick_color),
         );
 
         // Border
-        painter.rect_stroke(
-            rect,
-            3.0,
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 70)),
-            egui::StrokeKind::Middle,
-        );
+        painter.rect_stroke(rect, 3.0, border_stroke, egui::StrokeKind::Middle);
 
         ui.add_sized(
             egui::vec2(56.0, 14.0),
@@ -525,6 +543,13 @@ fn snr_bar_color(t: f32) -> egui::Color32 {
 
 fn show_volume_knob(ui: &mut egui::Ui, volume: f32) {
     let size = 80.0;
+
+    let knob_bg = ui.visuals().widgets.noninteractive.bg_fill;
+    let knob_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let track_bg = ui.visuals().widgets.inactive.bg_fill;
+    let needle_color = ui.visuals().text_color();
+    let dot_color = ui.visuals().widgets.noninteractive.fg_stroke.color;
+
     ui.vertical(|ui| {
         ui.label(egui::RichText::new("Volume").small());
         let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
@@ -533,12 +558,8 @@ fn show_volume_knob(ui: &mut egui::Ui, volume: f32) {
         let radius = size / 2.0 - 5.0;
 
         // Background circle
-        painter.circle_filled(center, radius, egui::Color32::from_rgb(45, 45, 45));
-        painter.circle_stroke(
-            center,
-            radius,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(75, 75, 75)),
-        );
+        painter.circle_filled(center, radius, knob_bg);
+        painter.circle_stroke(center, radius, knob_stroke);
 
         // Knob arc: 225° start, 270° total sweep (clockwise)
         let start_angle = std::f32::consts::PI * 1.25;
@@ -555,7 +576,7 @@ fn show_volume_knob(ui: &mut egui::Ui, volume: f32) {
             .collect();
         painter.add(egui::Shape::line(
             bg_points,
-            egui::Stroke::new(4.0, egui::Color32::from_rgb(55, 55, 55)),
+            egui::Stroke::new(4.0, track_bg),
         ));
 
         // Filled arc
@@ -583,11 +604,8 @@ fn show_volume_knob(ui: &mut egui::Ui, volume: f32) {
             center.x + radius * 0.80 * needle_angle.cos(),
             center.y + radius * 0.80 * needle_angle.sin(),
         );
-        painter.line_segment(
-            [p_inner, p_outer],
-            egui::Stroke::new(2.0, egui::Color32::from_rgb(210, 210, 210)),
-        );
-        painter.circle_filled(center, 3.5, egui::Color32::from_rgb(130, 130, 130));
+        painter.line_segment([p_inner, p_outer], egui::Stroke::new(2.0, needle_color));
+        painter.circle_filled(center, 3.5, dot_color);
 
         // Value label
         let label = if volume == 0.0 {
@@ -603,6 +621,33 @@ impl eframe::App for LiveMusicRemover {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_channels(ctx);
         ctx.request_repaint_after(Duration::from_millis(20));
+        ctx.set_visuals(if self.dark_mode {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+
+        if self.dark_mode != self.last_dark_mode {
+            self.last_dark_mode = self.dark_mode;
+            if let (Some(spec), Some(tex_slot)) =
+                (self.spec_noisy.as_ref(), self.noisy_texture.as_mut())
+            {
+                *tex_slot = ctx.load_texture(
+                    "noisy_spec",
+                    spec.to_color_image(self.dark_mode),
+                    egui::TextureOptions::LINEAR,
+                );
+            }
+            if let (Some(spec), Some(tex_slot)) =
+                (self.spec_enh.as_ref(), self.enh_texture.as_mut())
+            {
+                *tex_slot = ctx.load_texture(
+                    "enh_spec",
+                    spec.to_color_image(self.dark_mode),
+                    egui::TextureOptions::LINEAR,
+                );
+            }
+        }
 
         if self.logo_texture.is_none() {
             let bytes = include_bytes!("../assets/logo.svg");
@@ -663,6 +708,10 @@ impl eframe::App for LiveMusicRemover {
                                     worker.should_stop().ok();
                                 }
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            let theme_icon = if self.dark_mode { "☀" } else { "🌙" };
+                            if ui.button(theme_icon).on_hover_text("Toggle light/dark mode").clicked() {
+                                self.dark_mode = !self.dark_mode;
                             }
                         });
                     });
