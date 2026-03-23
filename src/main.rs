@@ -98,7 +98,7 @@ pub fn main() -> eframe::Result<()> {
 }
 
 struct LiveMusicRemover {
-        freq_axis_scale: f32,
+    freq_axis_scale: f32,
     df_worker: Option<DeepFilterCapture>,
     lsnr: f32,
     atten_lim: f32,
@@ -180,7 +180,10 @@ impl SpecImage {
                     egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
             }
         }
-        egui::ColorImage { size: [nt, nf], pixels }
+        egui::ColorImage {
+            size: [nt, nf],
+            pixels,
+        }
     }
 }
 
@@ -265,7 +268,7 @@ impl LiveMusicRemover {
             r_device_event: Some(r_device_event),
             shared_volume,
             system_volume: 1.0,
-            freq_axis_scale: 1.0,
+            freq_axis_scale: 1.5,
         }
     }
 
@@ -803,12 +806,6 @@ impl eframe::App for LiveMusicRemover {
                                 ui.label(egui::RichText::new("Controls").strong());
                                 ui.add_space(4.0);
 
-                                ui.label("Frequency Axis Scale");
-                                if ui.add(egui::Slider::new(&mut self.freq_axis_scale, 0.5..=4.0).step_by(0.01)).changed() {
-                                    // No action needed, just triggers repaint
-                                }
-                                 
-
                                 ui.label("Noise Attenuation [dB]");
                                 if ui
                                     .add(egui::Slider::new(&mut self.atten_lim, 0.0..=100.0))
@@ -840,6 +837,8 @@ impl eframe::App for LiveMusicRemover {
                                         .send((DfControl::PostFilterBeta, self.post_filter_beta))
                                         .ok();
                                 }
+
+
 
                                 // ui.label("Threshold Min [dB]");
                                 //     if ui
@@ -891,6 +890,18 @@ impl eframe::App for LiveMusicRemover {
                                 //     }
                             });
 
+                            // Visualization Controls card
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Visualisation controls").strong());
+                                ui.add_space(4.0);
+
+                                ui.label("Frequency Axis Scale");
+                                if ui.add(egui::Slider::new(&mut self.freq_axis_scale, 0.5..=4.0).step_by(0.01)).changed() {
+                                    // No action needed, just triggers repaint
+                                }
+
+                            });
+
                             // // Status (below controls, in the same left column)
                             // if is_running {
                             //     ui.add_space(4.0);
@@ -907,10 +918,12 @@ impl eframe::App for LiveMusicRemover {
                         });
 
                         // Right column: SNR gauge + Volume knob
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            show_volume_knob(ui, self.system_volume);
-                            ui.add_space(8.0);
-                            show_snr_gauge(ui, self.lsnr);
+                        ui.group(|ui| {
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                show_volume_knob(ui, self.system_volume);
+                                ui.add_space(8.0);
+                                show_snr_gauge(ui, self.lsnr);
+                            });
                         });
                     });
                 });
@@ -934,8 +947,6 @@ impl eframe::App for LiveMusicRemover {
                     let spec_h = base_spec_h * self.freq_axis_scale;
                     let spec_w = 2000.0; // (avail_w - 8.0) / 2.0;
 
-
-                    
                     ui.vertical(|ui| {
                         if let Some(ref texture) = self.noisy_texture {
                             ui.vertical(|ui| {
