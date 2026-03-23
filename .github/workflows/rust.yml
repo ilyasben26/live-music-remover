@@ -2,9 +2,8 @@ name: live-music-remover
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    tags:
+      - "v*.*.*"
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +18,39 @@ jobs:
       with:
         submodules: true
     - name: Build
-      run: cargo +nightly run -p live-music-remover --features "ui" --bin live-music-remover --release --verbose
+      run: cargo +nightly build -p live-music-remover --features "ui" --bin live-music-remover --release --verbose
+      
+    - name: Rename binary
+      run: Rename-Item target/release/live-music-remover.exe live-music-remover-${{ github.ref_name }}.exe
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: live-music-remover
+        path: target/release/live-music-remover-${{ github.ref_name }}.exe
+
+  release:
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: live-music-remover
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: live-music-remover-${{ github.ref_name }}.exe
+          generate_release_notes: true
+          
+
+          
+
+
+      
+    
 #   - name: Run tests
 #     run: cargo test --verbose
