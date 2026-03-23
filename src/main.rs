@@ -5,16 +5,22 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
+use crate::volume::SystemVolume;
 use clap::{Parser, ValueHint};
 use crossbeam_channel::{unbounded, Receiver};
 use eframe::egui;
-use image_rs::{imageops, Rgba, RgbaImage};
+use image_rs::{Rgba, RgbaImage};
 
 mod capture;
 mod cmap;
 mod devices;
+mod volume;
 use capture::*;
 
 use crate::devices::{
@@ -75,19 +81,24 @@ pub fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("DeepFilterNet Demo")
-            .with_inner_size([1100.0, 900.0]),
+            .with_title("Live Music Remover")
+            .with_inner_size([1200.0, 750.0])
+            .with_min_inner_size([900.0, 400.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "DeepFilterNet Demo",
+        "Live Music Remover",
         options,
-        Box::new(|_cc| Ok(Box::new(LiveMusicRemover::new()))),
+        Box::new(|cc| {
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            Ok(Box::new(LiveMusicRemover::new()))
+        }),
     )
 }
 
 struct LiveMusicRemover {
+        freq_axis_scale: f32,
     df_worker: Option<DeepFilterCapture>,
     lsnr: f32,
     atten_lim: f32,
@@ -108,6 +119,8 @@ struct LiveMusicRemover {
     available_input_devices: Vec<String>,
     available_output_devices: Vec<String>,
     r_device_event: Option<Receiver<DeviceEvent>>,
+    shared_volume: Arc<AtomicU32>,
+    system_volume: f32,
 }
 
 struct SpecImage {
@@ -155,15 +168,19 @@ impl SpecImage {
         self.im.rotate_left((w - n_specs) * 4 * h);
     }
     fn to_color_image(&self) -> egui::ColorImage {
-        let rotated = imageops::rotate270(&self.im);
-        let pixels: Vec<egui::Color32> = rotated
-            .pixels()
-            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-            .collect();
-        egui::ColorImage {
-            size: [self.n_frames as usize, self.n_freqs as usize],
-            pixels,
+        // Time on x-axis (left=old, right=new), frequency on y-axis (top=high, bottom=low)
+        let nf = self.n_freqs as usize;
+        let nt = self.n_frames as usize;
+        let mut pixels = vec![egui::Color32::BLACK; nf * nt];
+        for (t, row) in self.im.rows().enumerate() {
+            for (f, p) in row.enumerate() {
+                let out_x = t; // time: left=old, right=new
+                let out_y = nf - 1 - f; // frequency: top=high, bottom=low
+                pixels[out_y * nt + out_x] =
+                    egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
+            }
         }
+        egui::ColorImage { size: [nt, nf], pixels }
     }
 }
 
@@ -174,6 +191,21 @@ impl LiveMusicRemover {
         let (_s_enh, r_enh) = unbounded();
         let (s_controls, _r_controls) = unbounded();
         let (_s_device_event, r_device_event) = unbounded();
+        let shared_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let sv = shared_volume.clone();
+        std::thread::spawn(move || {
+            let sys_vol = SystemVolume::new()
+                .map_err(|e| log::warn!("Volume monitor: {e}"))
+                .ok();
+            loop {
+                let vol = sys_vol
+                    .as_ref()
+                    .map(|v: &SystemVolume| v.get_scalar())
+                    .unwrap_or(1.0);
+                sv.store(vol.to_bits(), Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
 
         let available_input_devices = get_input_devices().unwrap_or_else(|e| {
             log::error!("Failed to get input devices: {}", e);
@@ -231,10 +263,16 @@ impl LiveMusicRemover {
             available_input_devices,
             available_output_devices,
             r_device_event: Some(r_device_event),
+            shared_volume,
+            system_volume: 1.0,
+            freq_axis_scale: 1.0,
         }
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
+        // Update system volume from shared atomic written by the background thread
+        self.system_volume = f32::from_bits(self.shared_volume.load(Ordering::Relaxed));
+
         // Update LSNR
         if !self.r_lsnr.is_empty() {
             let mut lsnr = 0.0f32;
@@ -338,6 +376,7 @@ impl LiveMusicRemover {
             Some(s_enh),
             Some(r_controls),
             Some(s_device_event),
+            self.shared_volume.clone(),
         ) {
             Ok(df_worker) => {
                 let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
@@ -423,236 +462,504 @@ impl LiveMusicRemover {
     }
 }
 
+fn show_snr_gauge(ui: &mut egui::Ui, lsnr: f32) {
+    const SNR_MIN: f32 = -20.0;
+    const SNR_MAX: f32 = 20.0;
+    let fill_frac = ((lsnr - SNR_MIN) / (SNR_MAX - SNR_MIN)).clamp(0.0, 1.0);
+    let gauge_w = 28.0;
+    let gauge_h = 100.0;
+
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new("SNR").small());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(gauge_w, gauge_h), egui::Sense::hover());
+        let painter = ui.painter();
+
+        // Background
+        painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(35, 35, 35));
+
+        // Fill bar (grows upward)
+        if fill_frac > 0.0 {
+            let fill_h = (gauge_h - 2.0) * fill_frac;
+            let fill_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + 2.0, rect.max.y - 1.0 - fill_h),
+                egui::pos2(rect.max.x - 2.0, rect.max.y - 1.0),
+            );
+            painter.rect_filled(fill_rect, 2.0, snr_bar_color(fill_frac));
+        }
+
+        // Threshold tick at 5 dB (music-detected boundary)
+        let thresh_frac = (5.0 - SNR_MIN) / (SNR_MAX - SNR_MIN);
+        let tick_y = rect.max.y - gauge_h * thresh_frac;
+        painter.line_segment(
+            [
+                egui::pos2(rect.min.x, tick_y),
+                egui::pos2(rect.max.x, tick_y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)),
+        );
+
+        // Border
+        painter.rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 70, 70)),
+            egui::StrokeKind::Middle,
+        );
+
+        ui.add_sized(
+            egui::vec2(56.0, 14.0),
+            egui::Label::new(egui::RichText::new(format!("{:+.1} dB", lsnr)).small()),
+        );
+    });
+}
+
+fn snr_bar_color(t: f32) -> egui::Color32 {
+    // red → orange → green as SNR increases
+    let (r, g) = if t < 0.5 {
+        let s = t * 2.0;
+        (220u8, (60.0 + s * 160.0) as u8)
+    } else {
+        let s = (t - 0.5) * 2.0;
+        ((220.0 - s * 140.0) as u8, 220u8)
+    };
+    egui::Color32::from_rgb(r, g, 20)
+}
+
+fn show_volume_knob(ui: &mut egui::Ui, volume: f32) {
+    let size = 80.0;
+    ui.vertical(|ui| {
+        ui.label(egui::RichText::new("Volume").small());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let painter = ui.painter();
+        let center = rect.center();
+        let radius = size / 2.0 - 5.0;
+
+        // Background circle
+        painter.circle_filled(center, radius, egui::Color32::from_rgb(45, 45, 45));
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(75, 75, 75)),
+        );
+
+        // Knob arc: 225° start, 270° total sweep (clockwise)
+        let start_angle = std::f32::consts::PI * 1.25;
+        let total_sweep = std::f32::consts::PI * 1.5;
+        let track_r = radius * 0.68;
+        let n = 48usize;
+
+        // Background track
+        let bg_points: Vec<egui::Pos2> = (0..=n)
+            .map(|i| {
+                let a = start_angle + (i as f32 / n as f32) * total_sweep;
+                egui::pos2(center.x + track_r * a.cos(), center.y + track_r * a.sin())
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            bg_points,
+            egui::Stroke::new(4.0, egui::Color32::from_rgb(55, 55, 55)),
+        ));
+
+        // Filled arc
+        if volume > 0.001 {
+            let filled_segs = ((n as f32 * volume) as usize + 1).min(n);
+            let val_points: Vec<egui::Pos2> = (0..=filled_segs)
+                .map(|i| {
+                    let a = start_angle + (i as f32 / n as f32) * total_sweep;
+                    egui::pos2(center.x + track_r * a.cos(), center.y + track_r * a.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(
+                val_points,
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(90, 160, 230)),
+            ));
+        }
+
+        // Indicator needle
+        let needle_angle = start_angle + volume * total_sweep;
+        let p_inner = egui::pos2(
+            center.x + radius * 0.28 * needle_angle.cos(),
+            center.y + radius * 0.28 * needle_angle.sin(),
+        );
+        let p_outer = egui::pos2(
+            center.x + radius * 0.80 * needle_angle.cos(),
+            center.y + radius * 0.80 * needle_angle.sin(),
+        );
+        painter.line_segment(
+            [p_inner, p_outer],
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(210, 210, 210)),
+        );
+        painter.circle_filled(center, 3.5, egui::Color32::from_rgb(130, 130, 130));
+
+        // Value label
+        let label = if volume == 0.0 {
+            "Muted".to_string()
+        } else {
+            format!("{}%", (volume * 100.0).round() as u32)
+        };
+        ui.label(egui::RichText::new(label).small());
+    });
+}
+
 impl eframe::App for LiveMusicRemover {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Poll channels for new data
         self.poll_channels(ctx);
-
-        // Request repaint at 20ms intervals for real-time updates
         ctx.request_repaint_after(Duration::from_millis(20));
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Title bar row
-            ui.horizontal(|ui| {
-                ui.heading("Live Music Remover");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Exit").clicked() {
-                        if let Some(worker) = self.df_worker.as_mut() {
-                            worker.should_stop().ok();
-                        }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            });
+        let is_running = self.df_worker.is_some();
+        let start_enabled =
+            !is_running && self.input_device.is_some() && self.output_device.is_some();
 
-            ui.separator();
+        // ── Left panel: all controls ─────────────────────────────────────────
+        egui::SidePanel::left("controls_panel")
+            .resizable(false)
+            .exact_width(420.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(8.0);
 
-            // Device selection
-            let selected_input = self.input_device.clone().unwrap_or_default();
-            let input_devices = self.available_input_devices.clone();
-            let current_input = self.input_device.clone();
-            egui::ComboBox::from_label("Input device")
-                .selected_text(&selected_input)
-                .show_ui(ui, |ui| {
-                    for device in &input_devices {
-                        let is_selected = current_input.as_deref() == Some(device.as_str());
-                        if ui.selectable_label(is_selected, device).clicked() {
-                            let device = device.clone();
-                            self.refresh_devices();
-                            if self.df_worker.is_some() {
-                                self.stop_capture();
-                                self.spec_noisy = None;
-                                self.spec_enh = None;
-                                self.noisy_texture = None;
-                                self.enh_texture = None;
-                                if device_exists(
-                                    Some(device.as_str()),
-                                    &self.available_input_devices,
-                                ) {
-                                    self.input_device = Some(device);
-                                } else {
-                                    self.auto_select_input_device();
+                    // Title row with status dot
+                    ui.horizontal(|ui| {
+                        let (dot_color, dot_tip) = if is_running {
+                            (egui::Color32::from_rgb(80, 200, 80), "Processing audio")
+                        } else {
+                            (egui::Color32::from_rgb(120, 120, 120), "Stopped")
+                        };
+                        ui.colored_label(dot_color, "●").on_hover_text(dot_tip);
+                        ui.heading("Live Music Remover");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Exit").clicked() {
+                                if let Some(worker) = self.df_worker.as_mut() {
+                                    worker.should_stop().ok();
                                 }
-                                let inp = self.input_device.clone();
-                                let out = self.output_device.clone();
-                                self.start_capture(inp, out);
-                            } else if device_exists(
-                                Some(device.as_str()),
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                    });
+
+                    ui.add_space(6.0);
+
+                    // Devices card
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Audio Devices").strong());
+                        ui.add_space(4.0);
+
+                        let selected_input = self.input_device.clone().unwrap_or_default();
+                        let input_devices = self.available_input_devices.clone();
+                        let current_input = self.input_device.clone();
+                        ui.label("Input device:");
+                        egui::ComboBox::from_id_salt("input_device")
+                            .width(380.0)
+                            .selected_text(&selected_input)
+                            .show_ui(ui, |ui| {
+                                for device in &input_devices {
+                                    let is_selected =
+                                        current_input.as_deref() == Some(device.as_str());
+                                    if ui.selectable_label(is_selected, device).clicked() {
+                                        let device = device.clone();
+                                        self.refresh_devices();
+                                        if self.df_worker.is_some() {
+                                            self.stop_capture();
+                                            self.spec_noisy = None;
+                                            self.spec_enh = None;
+                                            self.noisy_texture = None;
+                                            self.enh_texture = None;
+                                            if device_exists(
+                                                Some(device.as_str()),
+                                                &self.available_input_devices,
+                                            ) {
+                                                self.input_device = Some(device);
+                                            } else {
+                                                self.auto_select_input_device();
+                                            }
+                                            let inp = self.input_device.clone();
+                                            let out = self.output_device.clone();
+                                            self.start_capture(inp, out);
+                                        } else if device_exists(
+                                            Some(device.as_str()),
+                                            &self.available_input_devices,
+                                        ) {
+                                            self.input_device = Some(device);
+                                        } else {
+                                            self.auto_select_input_device();
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.add_space(4.0);
+
+                        let selected_output = self.output_device.clone().unwrap_or_default();
+                        let output_devices = self.available_output_devices.clone();
+                        let current_output = self.output_device.clone();
+                        ui.label("Output device:");
+                        egui::ComboBox::from_id_salt("output_device")
+                            .width(380.0)
+                            .selected_text(&selected_output)
+                            .show_ui(ui, |ui| {
+                                for device in &output_devices {
+                                    let is_selected =
+                                        current_output.as_deref() == Some(device.as_str());
+                                    if ui.selectable_label(is_selected, device).clicked() {
+                                        let device = device.clone();
+                                        self.refresh_devices();
+                                        if self.df_worker.is_some() {
+                                            self.stop_capture();
+                                            self.spec_noisy = None;
+                                            self.spec_enh = None;
+                                            self.noisy_texture = None;
+                                            self.enh_texture = None;
+                                            if device_exists(
+                                                Some(device.as_str()),
+                                                &self.available_output_devices,
+                                            ) {
+                                                self.output_device = Some(device);
+                                            } else {
+                                                self.auto_select_output_device();
+                                            }
+                                            let inp = self.input_device.clone();
+                                            let out = self.output_device.clone();
+                                            self.start_capture(inp, out);
+                                        } else if device_exists(
+                                            Some(device.as_str()),
+                                            &self.available_output_devices,
+                                        ) {
+                                            self.output_device = Some(device);
+                                        } else {
+                                            self.auto_select_output_device();
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.add_space(4.0);
+                        if ui.button("Refresh Devices").clicked() {
+                            self.refresh_devices();
+                            if !device_exists(
+                                self.input_device.as_deref(),
                                 &self.available_input_devices,
                             ) {
-                                self.input_device = Some(device);
-                            } else {
                                 self.auto_select_input_device();
                             }
-                        }
-                    }
-                });
-
-            let selected_output = self.output_device.clone().unwrap_or_default();
-            let output_devices = self.available_output_devices.clone();
-            let current_output = self.output_device.clone();
-            egui::ComboBox::from_label("Output device")
-                .selected_text(&selected_output)
-                .show_ui(ui, |ui| {
-                    for device in &output_devices {
-                        let is_selected = current_output.as_deref() == Some(device.as_str());
-                        if ui.selectable_label(is_selected, device).clicked() {
-                            let device = device.clone();
-                            self.refresh_devices();
-                            if self.df_worker.is_some() {
-                                self.stop_capture();
-                                self.spec_noisy = None;
-                                self.spec_enh = None;
-                                self.noisy_texture = None;
-                                self.enh_texture = None;
-                                if device_exists(
-                                    Some(device.as_str()),
-                                    &self.available_output_devices,
-                                ) {
-                                    self.output_device = Some(device);
-                                } else {
-                                    self.auto_select_output_device();
-                                }
-                                let inp = self.input_device.clone();
-                                let out = self.output_device.clone();
-                                self.start_capture(inp, out);
-                            } else if device_exists(
-                                Some(device.as_str()),
+                            if !device_exists(
+                                self.output_device.as_deref(),
                                 &self.available_output_devices,
                             ) {
-                                self.output_device = Some(device);
-                            } else {
                                 self.auto_select_output_device();
                             }
                         }
-                    }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Start / Stop buttons
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                start_enabled,
+                                egui::Button::new("▶  Start").min_size(egui::vec2(100.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            let inp = self.input_device.clone();
+                            let out = self.output_device.clone();
+                            self.start_capture(inp, out);
+                        }
+                        if ui
+                            .add_enabled(
+                                is_running,
+                                egui::Button::new("■  Stop").min_size(egui::vec2(100.0, 32.0)),
+                            )
+                            .clicked()
+                        {
+                            self.stop_capture();
+                            self.spec_noisy = None;
+                            self.spec_enh = None;
+                            self.noisy_texture = None;
+                            self.enh_texture = None;
+                        }
+                        if !is_running && !start_enabled {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 80, 80),
+                                "Select devices to start.",
+                            );
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        // Left column: sliders, constrained so the right column always fits
+                        let right_col_w = 100.0;
+                        let left_col_w = ui.available_width()
+                            - right_col_w
+                            - ui.spacing().item_spacing.x * 2.0;
+                        ui.vertical(|ui| {
+                            ui.set_max_width(left_col_w);
+
+                            // Controls card
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Controls").strong());
+                                ui.add_space(4.0);
+
+                                ui.label("Frequency Axis Scale");
+                                if ui.add(egui::Slider::new(&mut self.freq_axis_scale, 0.5..=4.0).step_by(0.01)).changed() {
+                                    // No action needed, just triggers repaint
+                                }
+                                 
+
+                                ui.label("Noise Attenuation [dB]");
+                                if ui
+                                    .add(egui::Slider::new(&mut self.atten_lim, 0.0..=100.0))
+                                    .on_hover_text(
+                                        "Controls how aggressively music is removed. \
+                                         Higher values remove more music but may affect voice quality.",
+                                    )
+                                    .changed()
+                                {
+                                    self.s_controls
+                                        .send((DfControl::AttenLim, self.atten_lim))
+                                        .ok();
+                                }
+
+                                ui.add_space(4.0);
+                                ui.label("Post Filter Beta");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.post_filter_beta, 0.0..=1.0)
+                                            .step_by(0.001),
+                                    )
+                                    .on_hover_text(
+                                        "Smooths the filter's effect on the audio. \
+                                         Increase if you hear musical artefacts in the output.",
+                                    )
+                                    .changed()
+                                {
+                                    self.s_controls
+                                        .send((DfControl::PostFilterBeta, self.post_filter_beta))
+                                        .ok();
+                                }
+
+                                // ui.label("Threshold Min [dB]");
+                                //     if ui
+                                //         .add(
+                                //             egui::Slider::new(
+                                //                 &mut self.min_threshdb,
+                                //                 -15.0..=35.0,
+                                //             )
+                                //             .step_by(1.0),
+                                //         )
+                                //         .changed()
+                                //     {
+                                //         self.s_controls
+                                //             .send((DfControl::MinThreshDb, self.min_threshdb))
+                                //             .ok();
+                                //     }
+                                //     ui.label("Threshold ERB Max [dB]");
+                                //     if ui
+                                //         .add(
+                                //             egui::Slider::new(
+                                //                 &mut self.max_erbthreshdb,
+                                //                 -15.0..=35.0,
+                                //             )
+                                //             .step_by(1.0),
+                                //         )
+                                //         .changed()
+                                //     {
+                                //         self.s_controls
+                                //             .send((
+                                //                 DfControl::MaxErbThreshDb,
+                                //                 self.max_erbthreshdb,
+                                //             ))
+                                //             .ok();
+                                //     }
+                                //     ui.label("Threshold DF Max [dB]");
+                                //     if ui
+                                //         .add(
+                                //             egui::Slider::new(
+                                //                 &mut self.max_dfthreshdb,
+                                //                 -15.0..=35.0,
+                                //             )
+                                //             .step_by(1.0),
+                                //         )
+                                //         .changed()
+                                //     {
+                                //         self.s_controls
+                                //             .send((DfControl::MaxDfThreshDb, self.max_dfthreshdb))
+                                //             .ok();
+                                //     }
+                            });
+
+                            // // Status (below controls, in the same left column)
+                            // if is_running {
+                            //     ui.add_space(4.0);
+                            //     ui.horizontal(|ui| {
+                            //         ui.spinner();
+                            //         let status = if self.lsnr < 5.0 {
+                            //             "Music detected — removing"
+                            //         } else {
+                            //             "No music detected"
+                            //         };
+                            //         ui.label(status);
+                            //     });
+                            // }
+                        });
+
+                        // Right column: SNR gauge + Volume knob
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            show_volume_knob(ui, self.system_volume);
+                            ui.add_space(8.0);
+                            show_snr_gauge(ui, self.lsnr);
+                        });
+                    });
                 });
-
-            if ui.button("Refresh Devices").clicked() {
-                self.refresh_devices();
-                if !device_exists(self.input_device.as_deref(), &self.available_input_devices) {
-                    self.auto_select_input_device();
-                }
-                if !device_exists(
-                    self.output_device.as_deref(),
-                    &self.available_output_devices,
-                ) {
-                    self.auto_select_output_device();
-                }
-            }
-
-            ui.separator();
-
-            // Start / Stop buttons
-            let start_enabled = self.df_worker.is_none()
-                && self.input_device.is_some()
-                && self.output_device.is_some();
-            let stop_enabled = self.df_worker.is_some();
-
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(start_enabled, egui::Button::new("Start"))
-                    .clicked()
-                {
-                    let inp = self.input_device.clone();
-                    let out = self.output_device.clone();
-                    self.start_capture(inp, out);
-                }
-                if ui
-                    .add_enabled(stop_enabled, egui::Button::new("Stop"))
-                    .clicked()
-                {
-                    self.stop_capture();
-                    self.spec_noisy = None;
-                    self.spec_enh = None;
-                    self.noisy_texture = None;
-                    self.enh_texture = None;
-                }
-                if self.df_worker.is_none() && !start_enabled {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 60, 60),
-                        "Select input and output devices to start.",
-                    );
-                }
             });
 
-            ui.separator();
+        // ── Central panel: visualisation ─────────────────────────────────────
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CollapsingHeader::new("Visualisation")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if !is_running {
+                        ui.add_space(20.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label("Start processing to see the audio visualisation.");
+                        });
+                        return;
+                    }
+                    let avail_w = ui.available_width();
+                    // Frequency (y-axis) gets full height; time (x-axis) gets half the width each
+                    let base_spec_h = 1000.0; // or ui.available_height() - 24.0;
+                    let spec_h = base_spec_h * self.freq_axis_scale;
+                    let spec_w = 2000.0; // (avail_w - 8.0) / 2.0;
 
-            // Sliders
-            #[cfg(feature = "thresholds")]
-            {
-                ui.label("Threshold Min [dB]");
-                if ui
-                    .add(egui::Slider::new(&mut self.min_threshdb, -15.0..=35.0).step_by(1.0))
-                    .changed()
-                {
-                    self.s_controls
-                        .send((DfControl::MinThreshDb, self.min_threshdb))
-                        .ok();
-                }
 
-                ui.label("Threshold ERB Max [dB]");
-                if ui
-                    .add(egui::Slider::new(&mut self.max_erbthreshdb, -15.0..=35.0).step_by(1.0))
-                    .changed()
-                {
-                    self.s_controls
-                        .send((DfControl::MaxErbThreshDb, self.max_erbthreshdb))
-                        .ok();
-                }
+                    
+                    ui.vertical(|ui| {
+                        if let Some(ref texture) = self.noisy_texture {
+                            ui.vertical(|ui| {
+                                ui.label("Before");
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
+                                );
+                            });
+                        }
 
-                ui.label("Threshold DF Max [dB]");
-                if ui
-                    .add(egui::Slider::new(&mut self.max_dfthreshdb, -15.0..=35.0).step_by(1.0))
-                    .changed()
-                {
-                    self.s_controls
-                        .send((DfControl::MaxDfThreshDb, self.max_dfthreshdb))
-                        .ok();
-                }
-            }
+                        ui.add_space(4.0);
 
-            ui.label("Noise Attenuation [dB]");
-            if ui
-                .add(egui::Slider::new(&mut self.atten_lim, 0.0..=100.0))
-                .changed()
-            {
-                self.s_controls
-                    .send((DfControl::AttenLim, self.atten_lim))
-                    .ok();
-            }
-
-            ui.label("Post Filter Beta");
-            if ui
-                .add(egui::Slider::new(&mut self.post_filter_beta, 0.0..=1.0).step_by(0.001))
-                .changed()
-            {
-                self.s_controls
-                    .send((DfControl::PostFilterBeta, self.post_filter_beta))
-                    .ok();
-            }
-
-            ui.separator();
-
-            // Spectrograms
-            if self.df_worker.is_some() {
-                if let Some(ref texture) = self.noisy_texture {
-                    ui.label("Noisy");
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(1000.0, 250.0)));
-                }
-                if let Some(ref texture) = self.enh_texture {
-                    ui.label("DeepFilterNet Enhanced");
-                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(1000.0, 250.0)));
-                }
-            }
-
-            ui.separator();
-
-            // SNR display
-            ui.horizontal(|ui| {
-                ui.label("Current SNR:");
-                ui.label(format!("{:>5.1} dB", self.lsnr));
-            });
+                        if let Some(ref texture) = self.enh_texture {
+                            ui.vertical(|ui| {
+                                ui.label("After");
+                                ui.add(
+                                    egui::Image::new(texture)
+                                        .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
+                                );
+                            });
+                        }
+                    });
+                });
         });
     }
 }

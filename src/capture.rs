@@ -18,7 +18,7 @@ use std::io::{self, stdout, Write};
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Once,
 };
 use std::thread::{self, sleep, JoinHandle};
@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
 use cpal::{BufferSize, Device, SampleRate, Stream, StreamConfig, SupportedStreamConfigRange};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use df::{tract::*, Complex32};
@@ -49,6 +50,8 @@ pub type SendControl = Sender<(DfControl, f32)>;
 pub type RecvControl = Receiver<(DfControl, f32)>;
 pub type SendDeviceEvent = Sender<DeviceEvent>;
 pub type RecvDeviceEvent = Receiver<DeviceEvent>;
+pub type SendVolume = Sender<f32>;
+pub type RecvVolume = Receiver<f32>;
 
 pub(crate) static INIT_LOGGER: Once = Once::new();
 pub(crate) static mut MODEL_PATH: Option<PathBuf> = None;
@@ -499,6 +502,7 @@ fn get_worker_fn(
     output_sr: usize,
     controls: AtomicControls,
     df_com: Option<GuiCom>,
+    shared_volume: Arc<AtomicU32>,
 ) -> impl FnMut() {
     let (has_init, should_stop, device_lost) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
@@ -567,7 +571,6 @@ fn get_worker_fn(
             let lsnr = df
                 .process(inframe.view(), outframe.view_mut())
                 .expect("Failed to run DeepFilterNet");
-            let mut n = 0;
             if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
                 let out_rows = (0..ch)
                     .map(|c| outframe.row(c).to_vec())
@@ -582,14 +585,17 @@ fn get_worker_fn(
                         interleaved_out[frame * ch + c] = buf[c][frame];
                     }
                 }
-                while n < interleaved_out.len() {
-                    n += rb_out.push_slice(&interleaved_out[n..]);
-                }
             } else {
                 planar_to_interleaved(outframe.as_slice().unwrap(), ch, &mut interleaved_out);
-                while n < interleaved_out.len() {
-                    n += rb_out.push_slice(&interleaved_out[n..]);
-                }
+            }
+            // Apply Windows master volume (and mute) to every output sample.
+            let vol = f32::from_bits(shared_volume.load(Ordering::Relaxed));
+            for s in interleaved_out.iter_mut() {
+                *s *= vol;
+            }
+            let mut n = 0;
+            while n < interleaved_out.len() {
+                n += rb_out.push_slice(&interleaved_out[n..]);
             }
             debug_assert_eq!(n, n_out * ch);
             rb_out.sync();
@@ -658,8 +664,18 @@ pub struct DeepFilterCapture {
 
 impl Default for DeepFilterCapture {
     fn default() -> Self {
-        DeepFilterCapture::new(None, None, None, None, None, None, None, None)
-            .expect("Error during DeepFilterCapture initialization")
+        DeepFilterCapture::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        )
+        .expect("Error during DeepFilterCapture initialization")
     }
 }
 impl DeepFilterCapture {
@@ -672,6 +688,7 @@ impl DeepFilterCapture {
         s_enh: Option<SendSpec>,
         r_opt: Option<RecvControl>,
         s_device_event: Option<SendDeviceEvent>,
+        shared_volume: Arc<AtomicU32>,
     ) -> Result<Self> {
         let ch = PROCESS_CHANNELS;
         let (sr, frame_size, freq_size) = init_df(model_path, ch);
@@ -714,6 +731,7 @@ impl DeepFilterCapture {
             sink.sr() as usize,
             controls,
             Some(df_com),
+            shared_volume,
         )));
         while !has_init.load(Ordering::Relaxed) {
             sleep(Duration::from_secs_f32(0.01));
