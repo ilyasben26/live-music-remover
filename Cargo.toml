@@ -3,6 +3,12 @@ name = "live-music-remover"
 version = "0.1.0"
 edition = "2021"
 
+description = "A real-time music remover."
+license = "MIT"
+repository = "https://github.com/ilyasben26/live-music-remover"
+homepage = "https://github.com/ilyasben26/live-music-remover"
+documentation = "https://github.com/ilyasben26/live-music-remover"
+
 [[bin]]
 name = "live-music-remover"
 path = "src/main.rs"

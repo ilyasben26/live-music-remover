@@ -1,6 +1,8 @@
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
 
 /// Wraps the Windows default render endpoint volume so the worker thread can
 /// read and apply the system master volume (including mute) to every frame.
@@ -21,8 +23,7 @@ impl SystemVolume {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-            let endpoint_volume: IAudioEndpointVolume =
-                device.Activate(CLSCTX_ALL, None)?;
+            let endpoint_volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
 
             Ok(Self { endpoint_volume })
         }
