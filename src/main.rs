@@ -40,6 +40,19 @@ struct Args {
     verbose: u8,
 }
 
+fn load_icon() -> egui::IconData {
+    let icon_bytes = include_bytes!("../assets/logo.png");
+    let img = image_rs::load_from_memory(icon_bytes)
+        .expect("Failed to load icon")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
+}
+
 pub fn main() -> eframe::Result<()> {
     let args = Args::parse();
     let level = match args.verbose {
@@ -74,7 +87,8 @@ pub fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Live Music Remover")
             .with_inner_size([1200.0, 750.0])
-            .with_min_inner_size([900.0, 500.0]),
+            .with_min_inner_size([900.0, 500.0])
+            .with_icon(load_icon()),
         ..Default::default()
     };
 
