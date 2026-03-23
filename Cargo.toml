@@ -31,6 +31,7 @@ deep_filter = { path = "third_party/DeepFilterNet/libDF/", default-features = fa
 ndarray = "^0.15"
 rubato = "0.15"
 ringbuf = "0.3"
+dirs = "5"
 env_logger = "0.10"
 log = { version = "0.4", features = ["std"] }
 thiserror = "1.0"

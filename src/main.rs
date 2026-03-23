@@ -3,8 +3,6 @@
     windows_subsystem = "windows"
 )]
 
-use std::env;
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
@@ -12,7 +10,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::volume::SystemVolume;
-use clap::{Parser, ValueHint};
+use clap::Parser;
 use crossbeam_channel::{unbounded, Receiver};
 use eframe::egui;
 use image_rs::{Rgba, RgbaImage};
@@ -21,7 +19,7 @@ mod capture;
 mod cmap;
 mod devices;
 mod volume;
-use capture::*;
+use capture::{ModelKind, *};
 
 use crate::devices::{
     device_exists, find_cable, get_input_devices, get_output_devices, set_output_device,
@@ -31,9 +29,6 @@ use crate::devices::{
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to model tar.gz
-    #[arg(short, long, value_hint = ValueHint::FilePath)]
-    model: Option<PathBuf>,
     /// Logging verbosity
     #[arg(
         long,
@@ -59,10 +54,6 @@ pub fn main() -> eframe::Result<()> {
         5 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
     };
-    if args.model.is_some() {
-        unsafe { MODEL_PATH = args.model }
-    }
-
     capture::INIT_LOGGER.call_once(|| {
         env_logger::Builder::from_env(env_logger::Env::default())
             .filter_level(level)
@@ -92,6 +83,7 @@ pub fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.set_zoom_factor(1.5);
             Ok(Box::new(LiveMusicRemover::new()))
         }),
     )
@@ -121,6 +113,7 @@ struct LiveMusicRemover {
     r_device_event: Option<Receiver<DeviceEvent>>,
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
+    selected_model: ModelKind,
 }
 
 struct SpecImage {
@@ -269,6 +262,7 @@ impl LiveMusicRemover {
             shared_volume,
             system_volume: 1.0,
             freq_axis_scale: 1.5,
+            selected_model: ModelKind::default(),
         }
     }
 
@@ -328,6 +322,7 @@ impl LiveMusicRemover {
     fn handle_device_lost(&mut self, event: DeviceEvent) {
         log::warn!("Audio device lost during capture, resetting UI and refreshing devices.");
         self.df_worker = None;
+        self.lsnr = 0.0;
         self.spec_noisy = None;
         self.spec_enh = None;
         self.noisy_texture = None;
@@ -368,10 +363,9 @@ impl LiveMusicRemover {
         let (s_controls, r_controls) = unbounded();
         let (s_device_event, r_device_event) = unbounded();
 
-        let model_path = env::var("DF_MODEL").ok().map(PathBuf::from);
-        log::info!("Using model path: {:?}", model_path);
+        log::info!("Using model: {}", self.selected_model.label());
         match DeepFilterCapture::new(
-            model_path,
+            self.selected_model,
             input_device,
             output_device,
             Some(s_lsnr),
@@ -424,6 +418,7 @@ impl LiveMusicRemover {
             worker.should_stop().expect("Failed to stop DF worker");
         }
         self.df_worker = None;
+        self.lsnr = 0.0;
     }
 
     fn refresh_devices(&mut self) {
@@ -751,6 +746,34 @@ impl eframe::App for LiveMusicRemover {
                                 self.auto_select_output_device();
                             }
                         }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Model selection (disabled while capturing)
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("Model").strong());
+                        ui.add_space(4.0);
+                        ui.add_enabled_ui(!is_running, |ui| {
+                            egui::ComboBox::from_id_salt("model_select")
+                                .width(380.0)
+                                .selected_text(self.selected_model.label())
+                                .show_ui(ui, |ui| {
+                                    for kind in [ModelKind::Standard, ModelKind::LowLatency] {
+                                        ui.selectable_value(
+                                            &mut self.selected_model,
+                                            kind,
+                                            kind.label(),
+                                        );
+                                    }
+                                });
+                        });
+                        // if is_running {
+                        //     ui.colored_label(
+                        //         egui::Color32::from_rgb(160, 160, 160),
+                        //         "Stop capturing to change model.",
+                        //     );
+                        // }
                     });
 
                     ui.add_space(8.0);

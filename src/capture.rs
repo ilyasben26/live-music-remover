@@ -16,7 +16,6 @@ use std::env;
 use std::fmt::Display;
 use std::io::{self, stdout, Write};
 use std::mem::MaybeUninit;
-use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Once,
@@ -54,8 +53,27 @@ pub type SendVolume = Sender<f32>;
 pub type RecvVolume = Receiver<f32>;
 
 pub(crate) static INIT_LOGGER: Once = Once::new();
-pub(crate) static mut MODEL_PATH: Option<PathBuf> = None;
 static mut MODEL: Option<DfTract> = None;
+static mut CURRENT_MODEL_KIND: Option<ModelKind> = None;
+
+const MODEL_STANDARD: &[u8] = include_bytes!("../models/DeepFilterNet3_onnx.tar.gz");
+const MODEL_LOW_LATENCY: &[u8] = include_bytes!("../models/DeepFilterNet3_ll_onnx.tar.gz");
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelKind {
+    Standard,
+    #[default]
+    LowLatency,
+}
+
+impl ModelKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelKind::Standard => "DeepFilterNet3 (standard)",
+            ModelKind::LowLatency => "DeepFilterNet3 LL (low-latency)",
+        }
+    }
+}
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 const PROCESS_CHANNELS: usize = 2;
@@ -83,26 +101,27 @@ pub enum DfControl {
 }
 
 /// Initialize DF model and returns sample rate, frame size, and number of frequency bins
-fn init_df(model_path: Option<PathBuf>, channels: usize) -> (usize, usize, usize) {
+fn init_df(model_kind: ModelKind, channels: usize) -> (usize, usize, usize) {
     unsafe {
         if let Some(m) = MODEL.as_ref() {
-            if m.ch == channels {
+            if m.ch == channels && CURRENT_MODEL_KIND == Some(model_kind) {
                 return (m.sr, m.hop_size, m.n_freqs);
             }
         }
     }
-    // let df_params = DfParams::default();
-    let df_params = if let Some(path) = model_path {
-        log::debug!("Not using default DF model, loading from path: {:?}", path);
-        DfParams::new(path).expect("Failed to read DF model")
-    } else {
-        log::debug!("Using default DF model");
-        DfParams::default()
+    let model_bytes = match model_kind {
+        ModelKind::Standard => MODEL_STANDARD,
+        ModelKind::LowLatency => MODEL_LOW_LATENCY,
     };
+    log::debug!("Loading embedded model: {}", model_kind.label());
+    let df_params = DfParams::from_bytes(model_bytes).expect("Failed to load embedded DF model");
     let r_params = RuntimeParams::default_with_ch(channels);
     let df = DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
     let (sr, frame_size, freq_size) = (df.sr, df.hop_size, df.n_freqs);
-    unsafe { MODEL = Some(df) };
+    unsafe {
+        MODEL = Some(df);
+        CURRENT_MODEL_KIND = Some(model_kind);
+    }
     (sr, frame_size, freq_size)
 }
 
@@ -665,7 +684,7 @@ pub struct DeepFilterCapture {
 impl Default for DeepFilterCapture {
     fn default() -> Self {
         DeepFilterCapture::new(
-            None,
+            ModelKind::default(),
             None,
             None,
             None,
@@ -680,7 +699,7 @@ impl Default for DeepFilterCapture {
 }
 impl DeepFilterCapture {
     pub fn new(
-        model_path: Option<PathBuf>,
+        model_kind: ModelKind,
         input_device: Option<String>,
         output_device: Option<String>,
         s_lsnr: Option<SendLsnr>,
@@ -691,7 +710,7 @@ impl DeepFilterCapture {
         shared_volume: Arc<AtomicU32>,
     ) -> Result<Self> {
         let ch = PROCESS_CHANNELS;
-        let (sr, frame_size, freq_size) = init_df(model_path, ch);
+        let (sr, frame_size, freq_size) = init_df(model_kind, ch);
         let in_rb = HeapRb::<f32>::new(frame_size * ch * 100);
         let out_rb = HeapRb::<f32>::new(frame_size * ch * 100);
         let (in_prod, in_cons) = in_rb.split();
