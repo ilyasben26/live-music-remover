@@ -701,7 +701,8 @@ impl eframe::App for LiveMusicRemover {
                         }
 
 
-                        ui.heading("Live Music Remover");
+                        // ui.heading(egui::RichText::new("Live Music Remover").strong());
+                        ui.label(egui::RichText::new("Live Music Remover").font(egui::FontId::proportional(30.0)).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit").clicked() {
                                 if let Some(worker) = self.df_worker.as_mut() {
