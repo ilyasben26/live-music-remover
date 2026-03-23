@@ -92,6 +92,12 @@ pub fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
+    log::debug!("CARGO_PKG_VERSION: {}", env!("CARGO_PKG_VERSION"));
+    log::debug!("CARGO_PKG_NAME: {}", env!("CARGO_PKG_NAME"));
+
+    // TODO: check if new version is available on releases page, see https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10
+    // TODO: see how to use winapi to show notifications on the device
+
     eframe::run_native(
         "Live Music Remover",
         options,
@@ -716,7 +722,18 @@ impl eframe::App for LiveMusicRemover {
 
 
                         // ui.heading(egui::RichText::new("Live Music Remover").strong());
-                        ui.label(egui::RichText::new("Live Music Remover").font(egui::FontId::proportional(30.0)).strong());
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("Live Music Remover")
+                                    .font(egui::FontId::proportional(30.0))
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit").clicked() {
                                 if let Some(worker) = self.df_worker.as_mut() {
