@@ -74,7 +74,7 @@ pub fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Live Music Remover")
             .with_inner_size([1200.0, 750.0])
-            .with_min_inner_size([900.0, 400.0]),
+            .with_min_inner_size([900.0, 500.0]),
         ..Default::default()
     };
 
@@ -83,7 +83,7 @@ pub fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            cc.egui_ctx.set_zoom_factor(1.5);
+            cc.egui_ctx.set_zoom_factor(1.2);
             Ok(Box::new(LiveMusicRemover::new()))
         }),
     )
@@ -102,6 +102,7 @@ struct LiveMusicRemover {
     spec_enh: Option<SpecImage>,
     noisy_texture: Option<egui::TextureHandle>,
     enh_texture: Option<egui::TextureHandle>,
+    logo_texture: Option<egui::TextureHandle>,
     r_lsnr: RecvLsnr,
     r_noisy: RecvSpec,
     r_enh: RecvSpec,
@@ -250,6 +251,7 @@ impl LiveMusicRemover {
             spec_enh: None,
             noisy_texture: None,
             enh_texture: None,
+            logo_texture: None,
             r_lsnr,
             r_noisy,
             r_enh,
@@ -322,7 +324,6 @@ impl LiveMusicRemover {
     fn handle_device_lost(&mut self, event: DeviceEvent) {
         log::warn!("Audio device lost during capture, resetting UI and refreshing devices.");
         self.df_worker = None;
-        self.lsnr = 0.0;
         self.spec_noisy = None;
         self.spec_enh = None;
         self.noisy_texture = None;
@@ -418,7 +419,6 @@ impl LiveMusicRemover {
             worker.should_stop().expect("Failed to stop DF worker");
         }
         self.df_worker = None;
-        self.lsnr = 0.0;
     }
 
     fn refresh_devices(&mut self) {
@@ -604,6 +604,14 @@ impl eframe::App for LiveMusicRemover {
         self.poll_channels(ctx);
         ctx.request_repaint_after(Duration::from_millis(20));
 
+        if self.logo_texture.is_none() {
+            let bytes = include_bytes!("../assets/logo.svg");
+            if let Ok(color_image) = egui_extras::image::load_svg_bytes(bytes) {
+                self.logo_texture =
+                    Some(ctx.load_texture("logo", color_image, egui::TextureOptions::LINEAR));
+            }
+        }
+
         let is_running = self.df_worker.is_some();
         let start_enabled =
             !is_running && self.input_device.is_some() && self.output_device.is_some();
@@ -616,14 +624,38 @@ impl eframe::App for LiveMusicRemover {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(8.0);
 
-                    // Title row with status dot
+                    // Title row with logo
                     ui.horizontal(|ui| {
-                        let (dot_color, dot_tip) = if is_running {
-                            (egui::Color32::from_rgb(80, 200, 80), "Processing audio")
+                        let logo_size = 42.0;
+
+                        let (response, painter) = ui.allocate_painter(
+                            egui::Vec2::splat(logo_size),
+                            egui::Sense::hover(),
+                        );
+                        let logo_rect = egui::Rect::from_center_size(
+                            response.rect.center(),
+                            egui::Vec2::splat(logo_size),
+                        );
+
+                        let tint = if is_running {
+                            egui::Color32::WHITE // original color
                         } else {
-                            (egui::Color32::from_rgb(120, 120, 120), "Stopped")
+                            egui::Color32::from_rgba_unmultiplied(180, 180, 180, 120) // dimmed
                         };
-                        ui.colored_label(dot_color, "●").on_hover_text(dot_tip);
+
+                        if let Some(tex) = &self.logo_texture {
+                            painter.image(
+                                tex.id(),
+                                logo_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                tint,
+                            );
+                        }
+
+
                         ui.heading("Live Music Remover");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit").clicked() {
@@ -945,7 +977,11 @@ impl eframe::App for LiveMusicRemover {
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 show_volume_knob(ui, self.system_volume);
                                 ui.add_space(8.0);
-                                show_snr_gauge(ui, self.lsnr);
+                                if is_running {
+                                    show_snr_gauge(ui, self.lsnr);
+                                } else {
+                                    show_snr_gauge(ui, 0.0);
+                                }
                             });
                         });
                     });

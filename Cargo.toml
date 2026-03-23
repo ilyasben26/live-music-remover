@@ -9,7 +9,7 @@ path = "src/main.rs"
 required-features = ["ui"]
 
 [features]
-ui = ["eframe", "image_rs"]
+ui = ["eframe", "image_rs", "egui_extras"]
 default-model-ll = ["deep_filter/default-model-ll"]
 thresholds = []
 dev-console = []
@@ -17,6 +17,7 @@ dev-console = []
 
 [dependencies]
 eframe = { version = "0.31.1", optional = true, features = ["default"] }
+egui_extras = { version = "0.31", optional = true, features = ["svg"] }
 itertools = "0.12"
 crossbeam-channel = "0.5"
 image_rs = { package = "image", version = "0.24", optional = true }
