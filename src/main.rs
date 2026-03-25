@@ -5,7 +5,7 @@
 
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use image_rs::{Rgba, RgbaImage};
 mod capture;
 mod cmap;
 mod devices;
+mod notify_update;
 mod volume;
+mod win_notification;
 use capture::{ModelKind, *};
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
@@ -96,9 +98,6 @@ pub fn main() -> eframe::Result<()> {
     log::debug!("CARGO_PKG_VERSION: {}", env!("CARGO_PKG_VERSION"));
     log::debug!("CARGO_PKG_NAME: {}", env!("CARGO_PKG_NAME"));
 
-    // TODO: check if new version is available on releases page, see https://docs.github.com/en/rest/releases/releases?apiVersion=2026-03-10
-    // TODO: see how to use winapi to show notifications on the device
-
     eframe::run_native(
         "Live Music Remover",
         options,
@@ -146,6 +145,7 @@ struct LiveMusicRemover {
     last_dark_mode: bool,
     router: Option<EguiRouter<LiveMusicRemover>>,
     current_page: Page,
+    update_info: Arc<Mutex<Option<(String, String)>>>,
 }
 
 struct SpecImage {
@@ -230,6 +230,10 @@ impl SpecImage {
 
 impl LiveMusicRemover {
     fn new() -> Self {
+        let update_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let update_info_thread = Arc::clone(&update_info);
+        std::thread::spawn(move || notify_update::check_for_update(update_info_thread));
+
         let (_s_lsnr, r_lsnr) = unbounded();
         let (_s_noisy, r_noisy) = unbounded();
         let (_s_enh, r_enh) = unbounded();
@@ -316,6 +320,7 @@ impl LiveMusicRemover {
             last_dark_mode: true,
             router: None,
             current_page: Page::Main,
+            update_info,
         };
 
         let router = EguiRouter::builder()
@@ -791,6 +796,18 @@ impl eframe::App for LiveMusicRemover {
                                     .small()
                                     .color(egui::Color32::GRAY),
                             );
+                            if let Ok(info) = self.update_info.lock() {
+                                if let Some((latest, url)) = info.as_ref() {
+                                    ui.add(
+                                        egui::Hyperlink::from_label_and_url(
+                                            egui::RichText::new(format!("New version v{} is available", latest.trim_start_matches('v')))
+                                                .small()
+                                                .color(egui::Color32::YELLOW),
+                                            url,
+                                        ),
+                                    );
+                                }
+                            }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Exit").clicked() {
@@ -1184,12 +1201,25 @@ fn home_route() -> impl Route<LiveMusicRemover> {
 }
 
 fn about_route() -> impl Route<LiveMusicRemover> {
-    |ui: &mut egui::Ui, _state: &mut LiveMusicRemover| {
+    |ui: &mut egui::Ui, state: &mut LiveMusicRemover| {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(16.0);
             ui.heading("About Live Music Remover");
             ui.add_space(8.0);
-            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.horizontal(|ui| {
+                ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                if let Ok(info) = state.update_info.lock() {
+                    if let Some((latest, url)) = info.as_ref() {
+                        ui.add(
+                            egui::Hyperlink::from_label_and_url(
+                                egui::RichText::new(format!("New version v{} is available", latest.trim_start_matches('v')))
+                                    .color(egui::Color32::YELLOW),
+                                url,
+                            ),
+                        );
+                    }
+                }
+            });
             ui.add_space(16.0);
             ui.separator();
             ui.add_space(8.0);
