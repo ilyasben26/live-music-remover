@@ -15,7 +15,7 @@ path = "src/main.rs"
 required-features = ["ui"]
 
 [features]
-ui = ["eframe", "image_rs", "egui_extras"]
+ui = ["eframe", "image_rs", "egui_extras", "egui_router"]
 default-model-ll = ["deep_filter/default-model-ll"]
 thresholds = []
 dev-console = []
@@ -23,6 +23,7 @@ dev-console = []
 
 [dependencies]
 eframe = { version = "0.31.1", optional = true, features = ["default"] }
+egui_router = { version = "0.4", optional = true }
 egui_extras = { version = "0.31", optional = true, features = ["svg"] }
 itertools = "0.12"
 crossbeam-channel = "0.5"
@@ -49,6 +50,9 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+    "Win32_System_Registry",
 ] }
 
 [build-dependencies]

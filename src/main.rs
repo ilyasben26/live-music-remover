@@ -20,6 +20,7 @@ mod cmap;
 mod devices;
 mod volume;
 use capture::{ModelKind, *};
+use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
     device_exists, find_cable, get_input_devices, get_output_devices, set_output_device,
@@ -108,6 +109,13 @@ pub fn main() -> eframe::Result<()> {
     )
 }
 
+#[derive(PartialEq, Clone)]
+enum Page {
+    Main,
+    About,
+    Help,
+}
+
 struct LiveMusicRemover {
     freq_axis_scale: f32,
     df_worker: Option<DeepFilterCapture>,
@@ -136,6 +144,8 @@ struct LiveMusicRemover {
     selected_model: ModelKind,
     dark_mode: bool,
     last_dark_mode: bool,
+    router: Option<EguiRouter<LiveMusicRemover>>,
+    current_page: Page,
 }
 
 struct SpecImage {
@@ -276,7 +286,7 @@ impl LiveMusicRemover {
             }
         };
 
-        Self {
+        let mut state = Self {
             df_worker: None,
             lsnr: 0.,
             atten_lim: 100.,
@@ -304,7 +314,19 @@ impl LiveMusicRemover {
             selected_model: ModelKind::default(),
             dark_mode: true,
             last_dark_mode: true,
-        }
+            router: None,
+            current_page: Page::Main,
+        };
+
+        let router = EguiRouter::builder()
+            .route("/", home_route)
+            .route("/about", about_route)
+            .route("/help", help_route)
+            .default_path("/")
+            .transition(TransitionConfig::fade().with_duration(0.01))
+            .build(&mut state);
+        state.router = Some(router);
+        state
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -681,8 +703,44 @@ impl eframe::App for LiveMusicRemover {
         let start_enabled =
             !is_running && self.input_device.is_some() && self.output_device.is_some();
 
-        // ── Left panel: all controls ─────────────────────────────────────────
-        egui::SidePanel::left("controls_panel")
+        // ── Router: take out for this frame ──────────────────────────────────
+        let mut router = self.router.take().unwrap();
+
+        // ── Top navigation bar ────────────────────────────────────────────────
+        let mut navigate_to: Option<String> = None;
+        egui::TopBottomPanel::top("nav_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // ui.add_space(4.0);
+                if ui
+                    .selectable_label(self.current_page == Page::Main, "🔨 Main")
+                    .clicked()
+                {
+                    self.current_page = Page::Main;
+                    navigate_to = Some("/".to_string());
+                }
+                if ui
+                    .selectable_label(self.current_page == Page::Help, "❓  Help")
+                    .clicked()
+                {
+                    self.current_page = Page::Help;
+                    navigate_to = Some("/help".to_string());
+                }
+                if ui
+                    .selectable_label(self.current_page == Page::About, "ℹ  About")
+                    .clicked()
+                {
+                    self.current_page = Page::About;
+                    navigate_to = Some("/about".to_string());
+                }
+            });
+        });
+        if let Some(route) = navigate_to {
+            router.navigate(self, route).ok();
+        }
+
+        // ── Left panel: all controls (main page only) ─────────────────────────
+        if self.current_page == Page::Main {
+            egui::SidePanel::left("controls_panel")
             .resizable(false)
             .exact_width(420.0)
             .show(ctx, |ui| {
@@ -1068,49 +1126,189 @@ impl eframe::App for LiveMusicRemover {
                     });
                 });
             });
+        } // end if Page::Main
 
-        // ── Central panel: visualisation ─────────────────────────────────────
+        // ── Central panel: router-controlled content ──────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::CollapsingHeader::new("Visualisation")
-                .default_open(true)
-                .show(ui, |ui| {
-                    if !is_running {
-                        ui.add_space(20.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label("Start processing to see the audio visualisation.");
-                        });
-                        return;
-                    }
-                    let avail_w = ui.available_width();
-                    // Frequency (y-axis) gets full height; time (x-axis) gets half the width each
-                    let base_spec_h = 1000.0; // or ui.available_height() - 24.0;
-                    let spec_h = base_spec_h * self.freq_axis_scale;
-                    let spec_w = 2000.0; // (avail_w - 8.0) / 2.0;
+            router.ui(ui, self);
+        });
 
-                    ui.vertical(|ui| {
-                        if let Some(ref texture) = self.noisy_texture {
-                            ui.vertical(|ui| {
-                                ui.label("Before");
-                                ui.add(
-                                    egui::Image::new(texture)
-                                        .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
-                                );
-                            });
-                        }
+        self.router = Some(router);
+    }
+}
 
-                        ui.add_space(4.0);
+// ── Route handlers ────────────────────────────────────────────────────────────
 
-                        if let Some(ref texture) = self.enh_texture {
-                            ui.vertical(|ui| {
-                                ui.label("After");
-                                ui.add(
-                                    egui::Image::new(texture)
-                                        .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
-                                );
-                            });
-                        }
+fn home_route() -> impl Route<LiveMusicRemover> {
+    |ui: &mut egui::Ui, state: &mut LiveMusicRemover| {
+        let is_running = state.df_worker.is_some();
+        egui::CollapsingHeader::new("Visualisation")
+            .default_open(true)
+            .show(ui, |ui| {
+                if !is_running {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label("Start processing to see the audio visualisation.");
                     });
+                    return;
+                }
+                let base_spec_h = 1000.0;
+                let spec_h = base_spec_h * state.freq_axis_scale;
+                let spec_w = 2000.0;
+
+                ui.vertical(|ui| {
+                    if let Some(ref texture) = state.noisy_texture {
+                        ui.vertical(|ui| {
+                            ui.label("Before");
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
+                            );
+                        });
+                    }
+
+                    ui.add_space(4.0);
+
+                    if let Some(ref texture) = state.enh_texture {
+                        ui.vertical(|ui| {
+                            ui.label("After");
+                            ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(egui::vec2(spec_h, spec_w)),
+                            );
+                        });
+                    }
                 });
+            });
+    }
+}
+
+fn about_route() -> impl Route<LiveMusicRemover> {
+    |ui: &mut egui::Ui, _state: &mut LiveMusicRemover| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(16.0);
+            ui.heading("About Live Music Remover");
+            ui.add_space(8.0);
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(
+                "Live Music Remover is a real-time audio processing tool that removes \
+                 background music and noise from a live audio stream while preserving speech. \
+                 It uses DeepFilterNet, a deep neural network trained for noise and \
+                 music suppression.",
+            );
+            ui.add_space(12.0);
+            ui.label(
+                "Audio is captured from a virtual audio cable input, processed \
+                 frame-by-frame through the DeepFilterNet model, and played back \
+                 on your chosen output device.",
+            );
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Built with").strong());
+            ui.add_space(4.0);
+            ui.label("• DeepFilterNet  — neural network for music/noise suppression");
+            ui.label("• egui / eframe  — immediate-mode GUI framework");
+            ui.label("• cpal           — cross-platform audio I/O");
+            ui.label("• rubato         — high-quality audio resampling");
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Source code").strong());
+            ui.add_space(4.0);
+            ui.label("https://github.com/ilyasben26/live-music-remover");
+        });
+    }
+}
+
+fn help_route() -> impl Route<LiveMusicRemover> {
+    |ui: &mut egui::Ui, _state: &mut LiveMusicRemover| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(16.0);
+            ui.label(
+                egui::RichText::new("How to use?")
+                    .font(egui::FontId::proportional(30.0))
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.separator();
+
+            ui.label("TODO: put link to youtube video tutorial");
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Step 1 — Install a virtual audio cable").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "Install VB-CABLE (https://vb-audio.com/Cable). This creates a virtual \
+                 input/output device pair that lets you route audio into Live Music Remover.",
+            );
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Step 2 — Route your audio").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "In your streaming software or system settings, set the playback device \
+                 to \"CABLE Input\". This sends the audio to Live Music Remover for processing.",
+            );
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Step 3 — Select devices").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "• Input device:  select \"CABLE Output\" (what your source is playing into).",
+            );
+            ui.label("• Output device: select your headphones or speakers.");
+            ui.label("  Use \"Refresh Devices\" if a device is missing from the list.");
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Step 4 — Choose a model").strong());
+            ui.add_space(4.0);
+            ui.label("• Standard");
+            ui.label("• Low Latency - Recommended.");
+            ui.label(
+                "It's a good idea to try both and see which one removes music best in your setup.",
+            );
+
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Step 5 — Start processing").strong());
+            ui.add_space(4.0);
+            ui.label("Click ▶ Start. Processed audio plays on your output device.");
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Controls").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "• Noise Attenuation [dB] — how aggressively music is removed. 0 means no filtering, 100 means maximum filtering. It's recommended to keep it at 100.",
+            );
+            ui.label(
+                "• Post Filter Beta — smooths the filter output. \
+                 Increase if you hear musical artefacts.",
+            );
+            ui.label("• Frequency Axis Scale — zooms the spectrogram visualisation.");
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("SNR Gauge").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "TODO: Add SNR gauge description",
+            );
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Reporting bugs / issues").strong());
+            ui.add_space(4.0);
+            ui.label(
+                "TODO: Add instructions and motivations for submiting a github issue",
+            )
+            
         });
     }
 }
