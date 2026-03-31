@@ -1,9 +1,85 @@
 
 
+<div align="center">
+
+<img src="assets/logo.svg" alt="Fast Music Remover Logo" width="100">
+
+# Live Music Remover
+
+</div>
+<div align="center">
+
+  [![GitHub release](https://img.shields.io/github/v/release/ilyasben26/live-music-remover?include_prereleases)](https://github.com/ilyasben26/live-music-remover/releases)
+  [![GitHub license](https://img.shields.io/github/license/ilyasben26/live-music-remover)](https://github.com/ilyasben26/live-music-remover/blob/main/LICENSE)
+  [![GitHub issues](https://img.shields.io/github/issues/ilyasben26/live-music-remover?color=blue)](https://github.com/ilyasben26/live-music-remover/issues)
+  ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
+  <!-- ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyasben26/live-music-remover/total) -->
+ <!-- ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ilyasben26/live-music-remover/rust.yml) -->
+</div>
+
+A real time-time audio processing tool that removes music and noise from a live audio stream while preserving speech. It uses the [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) model.
+
+
+> Very Important Note (PLEASE READ): In some cases, Live Music Remover can let through short blips of music or very faint musical artifacts, but this rarely happens and only when the music is too loud while a person is speaking. Furthermore, the blips don't form any coherent melody and are only perceptible when using headphones, if you notice them, try playing the audio through speakers, that should limit your perception of it. You have been warned. If I can, I will continue to monitor advances in this noise/music removal field and implement them on this project. If you know how to improve Live Music Remover, please open an issue or a pull request, any help will be appreciated. This project is a work in progress, there are bugs, if you encounter one, just close the app and open it again and that should fix it, and also make sure to open an issue on Github [here](https://github.com/ilyasben26/live-music-remover/issues) where you explain the bug so that I can fix it.
+
+
+> Another Note: Live Music Remover currently supports Windows only. MacOS integration is planned. For Linux users who want to remove music in real-time from their system's audio, there is a native way to do it on Linux using a LADSPA plugin, see this [here](https://github.com/Rikorose/DeepFilterNet/blob/main/ladspa/filter-chain-configs/deepfilter-stereo-sink.conf). (A video tutorial on the Linux setup is coming soon)
+
+## Demo
+todo!
+
+## How To Use For Removing Music From The System's Audio
+
+<!-- Watch the tutorial video: TODO!(insert video link) -->
+<!-- todo!(add pictures to the steps below to make it clearer) -->
+- To capture the system's audio and route it to *Live Music Remover*, install VB-CABLE (https://vb-audio.com/Cable).
+- In the windows sound setting, select **CABLE Input (VB-Audio Virtual Cable)**.`
+- Download the latest release of *Live Music Remover* from todo!(insert releases latest link)
+- Launch the downloaded executable. You might get a Windows SmartScreen warning that it can harm your device, just click on *Run Anyway*. It's totally safe, you can read the code and compile the binary yourself if you don't trust me.
+
+
+<!-- ## Features
+- Live music/noise removal. -->
+
+## Planned Features
+- Removing music from user-provided video / audio files.
+- Porting  to MacOS.
+- Improving the music removal pipeline.
+- Fixing bugs.
+
+## Dev Setup
+### Prerequisites
+- [Rust](https://rust-lang.org/tools/install/)
+
+### Running in dev mode
 ```powershell
+git clone https://github.com/ilyasben26/live-music-remover
 $Env:RUST_LOG="live-_music_remover=INFO,live_music_remover=DEBUG,df=DEBUG"
-$Env:DF_MODEL="c:\Users\ilyas\Repos\DeepFilterNet\models\DeepFilterNet3_ll_onnx.tar.gz"
-cargo +nightly run -p live-music-remover --features ui --bin live-music-remover --release
-cargo +nightly build -p live-music-remover --features ui --bin live-music-remover --release
 cargo +nightly build -p live-music-remover --features "ui,dev-console" --bin live-music-remover --release
 ```
+
+## Credits / Citations
+
+
+- The real-time audio processing code and the spectograms were initially copied from https://github.com/Rikorose/DeepFilterNet/tree/main/demo and slightly modified to support stereo audio and adjustable volume gain.
+- DeepFilterNet Repo: https://github.com/Rikorose/DeepFilterNet
+- DeepFilterNet citations:
+  ```bibtex
+  @inproceedings{schroeter2022deepfilternet,
+    title={{DeepFilterNet}: A Low Complexity Speech Enhancement Framework for Full-Band Audio based on Deep Filtering}, 
+    author = {Schröter, Hendrik and Escalante-B., Alberto N. and Rosenkranz, Tobias and Maier, Andreas},
+    booktitle={ICASSP 2022 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+    year={2022},
+    organization={IEEE}
+  }
+  ```
+  ```bibtex
+  @inproceedings{schroeter2023deepfilternet3,
+    title = {{DeepFilterNet}: Perceptually Motivated Real-Time Speech Enhancement},
+    author = {Schröter, Hendrik and Rosenkranz, Tobias and Escalante-B., Alberto N. and Maier, Andreas},
+    booktitle={INTERSPEECH},
+    year = {2023},
+  }
+  ```
+
+
