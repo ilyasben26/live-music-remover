@@ -415,7 +415,7 @@ impl LiveMusicRemover {
             input_noise_db: noise::OFF_DB,
             comfort_noise_db: noise::OFF_DB,
             freq_axis_scale: 1.5,
-            selected_model: ModelChoice::DeepFilter(ModelKind::default()),
+            selected_model: ModelChoice::Resemble,
             dark_mode: true,
             last_dark_mode: true,
             router: None,
@@ -1572,13 +1572,13 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label(egui::RichText::new("Step 4 — Choose a model").strong());
             ui.add_space(4.0);
             ui.label("• Standard");
-            ui.label("• Low Latency - Recommended.");
+            ui.label("• Low Latency");
             ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
             ui.label(
                 "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
             );
             ui.label(
-                "• Resemble Enhance - Resemble AI's speech denoiser. Runs on the GPU \
+                "• Resemble Enhance - Recommended (default). Resemble AI's speech denoiser. Runs on the GPU \
                  when available (about 0.4 s of delay) or on the CPU (about 1.2 s).",
             );
             ui.label(
