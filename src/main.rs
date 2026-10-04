@@ -18,10 +18,14 @@ use image_rs::{Rgba, RgbaImage};
 mod capture;
 mod cmap;
 mod devices;
+mod dpdfnet;
+mod dpdfnet_capture;
 mod notify_update;
 mod volume;
 mod win_notification;
 use capture::{ModelKind, *};
+use dpdfnet::DpdfModelKind;
+use dpdfnet_capture::DpdfNetCapture;
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
@@ -108,6 +112,47 @@ pub fn main() -> eframe::Result<()> {
     )
 }
 
+/// A model and the pipeline that runs it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelChoice {
+    DeepFilter(ModelKind),
+    DpdfNet(DpdfModelKind),
+}
+
+impl ModelChoice {
+    const ALL: [ModelChoice; 4] = [
+        ModelChoice::DeepFilter(ModelKind::Standard),
+        ModelChoice::DeepFilter(ModelKind::LowLatency),
+        ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr),
+        ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr),
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ModelChoice::DeepFilter(k) => k.label(),
+            ModelChoice::DpdfNet(k) => k.label(),
+        }
+    }
+
+    fn is_deep_filter(self) -> bool {
+        matches!(self, ModelChoice::DeepFilter(_))
+    }
+}
+
+enum CaptureWorker {
+    DeepFilter(DeepFilterCapture),
+    DpdfNet(DpdfNetCapture),
+}
+
+impl CaptureWorker {
+    fn should_stop(&mut self) -> anyhow::Result<()> {
+        match self {
+            CaptureWorker::DeepFilter(w) => w.should_stop(),
+            CaptureWorker::DpdfNet(w) => w.should_stop(),
+        }
+    }
+}
+
 #[derive(PartialEq, Clone)]
 enum Page {
     Main,
@@ -117,7 +162,7 @@ enum Page {
 
 struct LiveMusicRemover {
     freq_axis_scale: f32,
-    df_worker: Option<DeepFilterCapture>,
+    df_worker: Option<CaptureWorker>,
     lsnr: f32,
     atten_lim: f32,
     post_filter_beta: f32,
@@ -141,7 +186,7 @@ struct LiveMusicRemover {
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
     smoother_enabled: Arc<AtomicBool>,
-    selected_model: ModelKind,
+    selected_model: ModelChoice,
     dark_mode: bool,
     last_dark_mode: bool,
     router: Option<EguiRouter<LiveMusicRemover>>,
@@ -317,7 +362,7 @@ impl LiveMusicRemover {
             system_volume: 1.0,
             smoother_enabled: Arc::new(AtomicBool::new(true)),
             freq_axis_scale: 1.5,
-            selected_model: ModelKind::default(),
+            selected_model: ModelChoice::DeepFilter(ModelKind::default()),
             dark_mode: true,
             last_dark_mode: true,
             router: None,
@@ -433,39 +478,63 @@ impl LiveMusicRemover {
         let (s_device_event, r_device_event) = unbounded();
 
         log::info!("Using model: {}", self.selected_model.label());
-        match DeepFilterCapture::new(
-            self.selected_model,
-            input_device,
-            output_device,
-            Some(s_lsnr),
-            Some(s_noisy),
-            Some(s_enh),
-            Some(r_controls),
-            Some(s_device_event),
-            self.shared_volume.clone(),
-            self.smoother_enabled.clone(),
-        ) {
-            Ok(df_worker) => {
-                let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
-                let freq_res = df_worker.sr / 2 / (df_worker.freq_size - 1);
+        let result = match self.selected_model {
+            ModelChoice::DeepFilter(kind) => DeepFilterCapture::new(
+                kind,
+                input_device,
+                output_device,
+                Some(s_lsnr),
+                Some(s_noisy),
+                Some(s_enh),
+                Some(r_controls),
+                Some(s_device_event),
+                self.shared_volume.clone(),
+                self.smoother_enabled.clone(),
+            )
+            .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DeepFilter(w))),
+            ModelChoice::DpdfNet(kind) => DpdfNetCapture::new(
+                kind,
+                input_device,
+                output_device,
+                Some(s_noisy),
+                Some(s_enh),
+                Some(r_controls),
+                Some(s_device_event),
+                self.shared_volume.clone(),
+                self.smoother_enabled.clone(),
+            )
+            .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DpdfNet(w))),
+        };
+        match result {
+            Ok((sr, frame_size, freq_size, df_worker)) => {
+                let w = (sr / frame_size * 10) as u32;
+                let freq_res = sr / 2 / (freq_size - 1);
                 let h = (8000 / freq_res) as u32;
 
                 self.spec_noisy = Some(SpecImage::new(w, h, -100., -10.));
                 self.spec_enh = Some(SpecImage::new(w, h, -100., -10.));
                 self.df_worker = Some(df_worker);
+                self.lsnr = 0.;
                 self.r_lsnr = r_lsnr;
                 self.r_noisy = r_noisy;
                 self.r_enh = r_enh;
                 self.s_controls = s_controls;
                 self.r_device_event = Some(r_device_event);
-                // init_df always builds the model with post-filtering off; push the
-                // current slider value so a fresh start actually honors it.
-                self.s_controls
-                    .send((DfControl::PostFilterBeta, self.post_filter_beta))
-                    .ok();
+                // Push current slider values so a fresh start actually honors them:
+                // init_df builds DeepFilterNet with post-filtering off, and DPDFNet
+                // starts without an attenuation limit.
+                if self.selected_model.is_deep_filter() {
+                    self.s_controls
+                        .send((DfControl::PostFilterBeta, self.post_filter_beta))
+                        .ok();
+                } else {
+                    self.s_controls
+                        .send((DfControl::AttenLim, self.atten_lim))
+                        .ok();
+                }
             }
             Err(e) => {
-                log::error!("Failed to initialize DeepFilterNet audio capturing: {}", e);
+                log::error!("Failed to initialize audio capturing: {:#}", e);
                 self.df_worker = None;
                 self.refresh_devices();
                 if let Some(dev_err) = e.downcast_ref::<capture::DeviceSelectError>() {
@@ -955,11 +1024,11 @@ impl eframe::App for LiveMusicRemover {
                                 .width(380.0)
                                 .selected_text(self.selected_model.label())
                                 .show_ui(ui, |ui| {
-                                    for kind in [ModelKind::Standard, ModelKind::LowLatency] {
+                                    for choice in ModelChoice::ALL {
                                         ui.selectable_value(
                                             &mut self.selected_model,
-                                            kind,
-                                            kind.label(),
+                                            choice,
+                                            choice.label(),
                                         );
                                     }
                                 });
@@ -1039,22 +1108,26 @@ impl eframe::App for LiveMusicRemover {
                                         .ok();
                                 }
 
-                                ui.add_space(4.0);
-                                ui.label("Post Filter Beta");
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut self.post_filter_beta, 0.0..=1.0)
-                                            .step_by(0.001),
-                                    )
-                                    .on_hover_text(
-                                        "Smooths the filter's effect on the audio. \
-                                         Increase if you hear musical artefacts in the output.",
-                                    )
-                                    .changed()
-                                {
-                                    self.s_controls
-                                        .send((DfControl::PostFilterBeta, self.post_filter_beta))
-                                        .ok();
+                                // DPDFNet has no post filter.
+                                if self.selected_model.is_deep_filter() {
+                                    ui.add_space(4.0);
+                                    ui.label("Post Filter Beta");
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut self.post_filter_beta, 0.0..=1.0)
+                                                .step_by(0.001),
+                                        )
+                                        .on_hover_text(
+                                            "Smooths the filter's effect on the audio. \
+                                             Increase if you hear musical artefacts in the output.",
+                                        )
+                                        .changed()
+                                    {
+                                        self.s_controls
+                                            .send((DfControl::PostFilterBeta, self.post_filter_beta))
+                                            .ok();
+                                    }
+
                                 }
 
                                 ui.add_space(4.0);
@@ -1065,7 +1138,7 @@ impl eframe::App for LiveMusicRemover {
                                     .on_hover_text(
                                         "Ducks short loud spikes (musical-noise blips) relative \
                                          to the recent level. Toggle off to A/B against the raw \
-                                         DeepFilterNet output.",
+                                         model output.",
                                     )
                                     .changed()
                                 {
@@ -1154,11 +1227,14 @@ impl eframe::App for LiveMusicRemover {
                         ui.group(|ui| {
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 show_volume_knob(ui, self.system_volume);
-                                ui.add_space(8.0);
-                                if is_running {
-                                    show_snr_gauge(ui, self.lsnr);
-                                } else {
-                                    show_snr_gauge(ui, 0.0);
+                                // DPDFNet has no SNR estimate.
+                                if self.selected_model.is_deep_filter() {
+                                    ui.add_space(8.0);
+                                    if is_running {
+                                        show_snr_gauge(ui, self.lsnr);
+                                    } else {
+                                        show_snr_gauge(ui, 0.0);
+                                    }
                                 }
                             });
                         });
@@ -1263,6 +1339,8 @@ fn about_route() -> impl Route<LiveMusicRemover> {
             ui.label(egui::RichText::new("Built with").strong());
             ui.add_space(4.0);
             ui.label("• DeepFilterNet  — neural network for music/noise suppression");
+            ui.label("• DPDFNet        — speech enhancement model by Ceva (Apache-2.0)");
+            ui.label("• ONNX Runtime   — inference engine for DPDFNet");
             ui.label("• egui / eframe  — immediate-mode GUI framework");
             ui.label("• cpal           — cross-platform audio I/O");
             ui.label("• rubato         — high-quality audio resampling");
@@ -1320,6 +1398,10 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.add_space(4.0);
             ui.label("• Standard");
             ui.label("• Low Latency - Recommended.");
+            ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
+            ui.label(
+                "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
+            );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",
             );
