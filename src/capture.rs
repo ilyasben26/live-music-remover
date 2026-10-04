@@ -61,8 +61,8 @@ const MODEL_LOW_LATENCY: &[u8] = include_bytes!("../models/DeepFilterNet3_ll_onn
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelKind {
-    Standard,
     #[default]
+    Standard,
     LowLatency,
 }
 
@@ -115,7 +115,9 @@ fn init_df(model_kind: ModelKind, channels: usize) -> (usize, usize, usize) {
     };
     log::debug!("Loading embedded model: {}", model_kind.label());
     let df_params = DfParams::from_bytes(model_bytes).expect("Failed to load embedded DF model");
-    let r_params = RuntimeParams::default_with_ch(channels);
+    let r_params = RuntimeParams::default_with_ch(channels)
+        .with_thresholds(-15., 35., 35.)
+        .with_mask_reduce(ReduceMask::MAX);
     let df = DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
     let (sr, frame_size, freq_size) = (df.sr, df.hop_size, df.n_freqs);
     unsafe {

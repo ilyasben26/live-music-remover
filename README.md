@@ -5,7 +5,6 @@
 <img src="assets/logo.svg" alt="Fast Music Remover Logo" width="100">
 
 # Live Music Remover
-
 </div>
 <div align="center">
 
