@@ -1,5 +1,6 @@
 //! Experimental noise injection, shared by all pipelines:
-//! - input noise: pink noise added before the model;
+//! - input noise: pink noise added before the model, in an effort to reduce
+//!   musical artefacts;
 //! - comfort noise: pink noise added after the model, to mask musical artefacts.
 //!
 //! Levels are in dB relative to the input level (a power average over the last

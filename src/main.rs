@@ -665,9 +665,9 @@ impl LiveMusicRemover {
             if ui
                 .checkbox(&mut self.resemble_use_gpu, "Use GPU")
                 .on_hover_text(
-                    "On: runs on the GPU (DirectX 12) with about 0.4 s of delay, falling \
-                     back to the CPU if no GPU is usable. Off: runs on the CPU with about \
-                     1.2 s of delay and keeps up to four cores busy.",
+                    "On: runs on the GPU (DirectX 12) with lower latency, falling back to \
+                     the CPU if no GPU is usable. Off: runs on the CPU with more latency and \
+                     keeps up to four cores busy.",
                 )
                 .changed()
                 && self.df_worker.is_some()
@@ -690,8 +690,8 @@ impl LiveMusicRemover {
                 }
                 let delay_ms = w.delay_ms();
                 if delay_ms > 0 {
-                    ui.label(format!("·  Delay ≈ {delay_ms} ms")).on_hover_text(
-                        "Estimated time from input to output: the model's own delay plus \
+                    ui.label(format!("·  Latency ≈ {delay_ms} ms")).on_hover_text(
+                        "Estimated time from input to output: the model's own latency plus \
                          the audio buffered on each side. Excludes the audio devices' \
                          internal buffers.",
                     );
@@ -701,8 +701,8 @@ impl LiveMusicRemover {
         if self.selected_model == ModelChoice::Resemble {
             ui.label(
                 egui::RichText::new(
-                    "Resemble Enhance processes audio in blocks: adds about 0.4 s of delay \
-                     on the GPU, 1.2 s on the CPU.",
+                    "Resemble Enhance processes audio in blocks, which adds some latency \
+                     (less on the GPU than on the CPU).",
                 )
                 .small()
                 .color(egui::Color32::GRAY),
@@ -934,6 +934,14 @@ impl eframe::App for LiveMusicRemover {
                 {
                     self.current_page = Page::About;
                     navigate_to = Some("/about".to_string());
+                }
+                if ui
+                    .add(egui::Button::new("☕  Buy me a coffee").frame(false))
+                    .on_hover_text("https://ko-fi.com/ilyasdev")
+                    .clicked()
+                {
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab("https://ko-fi.com/ilyasdev"));
                 }
             });
         });
@@ -1289,7 +1297,8 @@ impl eframe::App for LiveMusicRemover {
                                     )
                                     .on_hover_text(
                                         "Experimental. Adds pink noise to the audio before the \
-                                         model, relative to the input level. Far left is off.",
+                                         model, relative to the input level, in an effort to \
+                                         reduce musical artefacts. Far left is off.",
                                     )
                                     .changed()
                                 {
@@ -1372,7 +1381,7 @@ impl eframe::App for LiveMusicRemover {
 
                             // Visualization Controls card
                             ui.group(|ui| {
-                                ui.label(egui::RichText::new("Visualisation controls").strong());
+                                ui.label(egui::RichText::new("Visualisation Controls").strong());
                                 ui.add_space(4.0);
 
                                 ui.label("Frequency Axis Scale");
@@ -1496,16 +1505,16 @@ fn about_route() -> impl Route<LiveMusicRemover> {
             ui.separator();
             ui.add_space(8.0);
             ui.label(
-                "Live Music Remover is a real-time audio processing tool that removes \
-                 background music and noise from a live audio stream while preserving speech. \
-                 It uses DeepFilterNet, a deep neural network trained for noise and \
-                 music suppression.",
+                "A Windows app that removes background music and noise from your \
+                 computer's audio in real time while keeping speech intact so you can \
+                 watch videos without the music.",
             );
             ui.add_space(12.0);
             ui.label(
-                "Audio is captured from a virtual audio cable input, processed \
-                 frame-by-frame through the DeepFilterNet model, and played back \
-                 on your chosen output device.",
+                "It captures your system audio through a virtual audio cable (VB-CABLE), \
+                 removes the music with a speech enhancement model (Resemble Enhance by \
+                 default, or DPDFNet or DeepFilterNet3) and plays the cleaned-up audio \
+                 through your speakers or headphones.",
             );
             ui.add_space(16.0);
             ui.separator();
@@ -1579,7 +1588,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             );
             ui.label(
                 "• Resemble Enhance - Recommended (default). Resemble AI's speech denoiser. Runs on the GPU \
-                 when available (about 0.4 s of delay) or on the CPU (about 1.2 s).",
+                 when available (lower latency) or on the CPU (higher latency).",
             );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",
