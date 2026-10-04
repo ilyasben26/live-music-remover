@@ -29,10 +29,12 @@ use crate::resemble::{ResembleDenoiser, BLOCK, HOP, LOOKAHEAD, SAMPLE_RATE};
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 /// Spectrogram FFT size: two hops, so one display frame per model hop.
 const SPEC_FFT: usize = 2 * HOP;
-/// Smallest model time the output margin allows for, in seconds. Rare DirectML
-/// spikes reach ~3x the usual denoiser time; a glitch costs more than 0.1 s of
-/// extra delay on top of the block latency.
-const MIN_MARGIN_S: f32 = 0.2;
+/// Smallest model time the output margin allows for, in seconds. With a run
+/// every block the GPU stays clocked up: ~30 ms typical, ~50 ms worst on an
+/// RTX 3060 laptop (idle GPUs between runs spike to ~180 ms).
+const MIN_MARGIN_S: f32 = 0.06;
+/// Input backlog tolerated before skipping ahead, in seconds.
+const MAX_INPUT_BACKLOG_S: f32 = 0.5;
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -354,9 +356,8 @@ impl Worker {
         let mut spec_noisy = SpecAnalyzer::new(&mut planner);
         let mut spec_enh = SpecAnalyzer::new(&mut planner);
         let mut smoother = Smoother::new(self.output_sr);
-        // Worst model time over roughly the last minute, to size the output
-        // margin. DirectML times jitter (GPU clocks), with spikes several times
-        // the typical block time.
+        // Recent worst model time, to size the output margin. DirectML times
+        // jitter with GPU clocks.
         let mut compute_peak = 0.0f32;
         let mut dropped = 0usize;
         let mut last_report = Instant::now();
@@ -387,7 +388,7 @@ impl Worker {
                 continue;
             }
             // Fell behind (e.g. a stall): skip old input instead of staying late.
-            let max_queued = n_in + BLOCK * self.input_sr / SAMPLE_RATE * 2;
+            let max_queued = n_in + (MAX_INPUT_BACKLOG_S * self.input_sr as f32) as usize;
             if queued > max_queued {
                 self.rb_in.skip(queued - n_in);
                 dropped += 1;
@@ -412,7 +413,9 @@ impl Worker {
                 block_out.fill(0.0);
             }
             let elapsed = t0.elapsed().as_secs_f32();
-            compute_peak = elapsed.max(compute_peak * 0.99);
+            // Decays with a half-life of about 30 s.
+            let decay = 0.5f32.powf(BLOCK as f32 / SAMPLE_RATE as f32 / 30.0);
+            compute_peak = elapsed.max(compute_peak * decay);
             block_in.clear();
 
             if let Some((ref s_noisy, ref s_enh)) = self.s_spec {
@@ -536,8 +539,9 @@ impl ResembleCapture {
 
         let in_sr = in_cfg.sample_rate.0 as usize;
         let out_sr = out_cfg.sample_rate.0 as usize;
-        let (in_prod, in_cons) = HeapRb::<f32>::new(BLOCK * in_sr / SAMPLE_RATE * 8).split();
-        let (out_prod, out_cons) = HeapRb::<f32>::new(BLOCK * out_sr / SAMPLE_RATE * 8).split();
+        // Two seconds each way, well above the backlog and margin limits.
+        let (in_prod, in_cons) = HeapRb::<f32>::new(in_sr * 2).split();
+        let (out_prod, out_cons) = HeapRb::<f32>::new(out_sr * 2).split();
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let device_lost = Arc::new(AtomicBool::new(false));

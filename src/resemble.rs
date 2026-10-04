@@ -4,7 +4,12 @@
 //! causal and takes a fixed `CHUNK`-sample window, so the stream is processed in
 //! overlapping windows: every `BLOCK` new samples the window slides and the
 //! model runs again. The block just before the last `LOOKAHEAD` samples (future
-//! context) is emitted, crossfaded with the previous run over `LOOKAHEAD` samples.
+//! context) is emitted, crossfaded with the previous run over `XFADE` samples.
+//!
+//! Small blocks cost GPU time but no quality (the window stays the same);
+//! shorter lookahead does cost quality. Measured on speech mixed with music
+//! (SI-SDR vs. clean speech): 457 ms block / 152 ms lookahead 11.0 dB,
+//! 95 / 152 ms 10.8 dB, 95 / 76 ms 10.1 dB, 95 / 38 ms 9.1 dB.
 
 use anyhow::{anyhow, Context, Result};
 use ort::ep;
@@ -17,13 +22,15 @@ pub const HOP: usize = 420;
 /// Frames per model window; must match the exported graph.
 const CHUNK_FRAMES: usize = 128;
 /// New frames per model run.
-const BLOCK_FRAMES: usize = 48;
-/// Future context frames after the emitted block; also the crossfade length.
+const BLOCK_FRAMES: usize = 10;
+/// Future context frames after the emitted block.
 const LOOKAHEAD_FRAMES: usize = 16;
 
 const CHUNK: usize = CHUNK_FRAMES * HOP;
 pub const BLOCK: usize = BLOCK_FRAMES * HOP;
 pub const LOOKAHEAD: usize = LOOKAHEAD_FRAMES * HOP;
+/// Crossfade with the previous run: it can't be longer than the emitted block.
+const XFADE: usize = if LOOKAHEAD < BLOCK { LOOKAHEAD } else { BLOCK };
 /// Offset of the emitted block within the window.
 const EMIT_START: usize = CHUNK - LOOKAHEAD - BLOCK;
 
@@ -112,7 +119,7 @@ impl ResembleDenoiser {
             session,
             on_gpu,
             window: vec![0.0; CHUNK],
-            prev_tail: vec![0.0; LOOKAHEAD],
+            prev_tail: vec![0.0; XFADE],
             atten_alpha: 0.0,
         })
     }
@@ -161,10 +168,12 @@ impl ResembleDenoiser {
         output.copy_from_slice(&y[EMIT_START..EMIT_START + BLOCK]);
         // Linear crossfade with the previous run, as upstream's chunk merging does.
         for (i, (o, p)) in output.iter_mut().zip(&self.prev_tail).enumerate() {
-            let w = (i as f32 + 0.5) / LOOKAHEAD as f32;
+            let w = (i as f32 + 0.5) / XFADE as f32;
             *o = p * (1.0 - w) + *o * w;
         }
-        self.prev_tail.copy_from_slice(&y[CHUNK - LOOKAHEAD..]);
+        // The next block starts where this run's lookahead does.
+        self.prev_tail
+            .copy_from_slice(&y[CHUNK - LOOKAHEAD..CHUNK - LOOKAHEAD + XFADE]);
         drop(outputs);
 
         let alpha = self.atten_alpha;

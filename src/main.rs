@@ -651,7 +651,7 @@ impl LiveMusicRemover {
         if self.selected_model == ModelChoice::Resemble {
             ui.label(
                 egui::RichText::new(
-                    "Resemble Enhance processes audio in blocks: adds about 0.9 s of delay.",
+                    "Resemble Enhance processes audio in blocks: adds about 0.4 s of delay.",
                 )
                 .small()
                 .color(egui::Color32::GRAY),
@@ -1476,7 +1476,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             );
             ui.label(
                 "• Resemble Enhance 44.1 kHz - Resemble AI's speech denoiser. Runs on the GPU \
-                 when available and adds about a second of delay.",
+                 when available and adds about 0.4 s of delay.",
             );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",
