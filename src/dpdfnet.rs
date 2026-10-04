@@ -404,6 +404,11 @@ impl DpdfNet {
         &self.channels[c].spec_noisy
     }
 
+    /// Output lag behind the input in samples (window priming plus model delay).
+    pub fn delay_samples(&self) -> usize {
+        self.hop_size * (1 + MODEL_DELAY_FRAMES)
+    }
+
     /// Enhanced spectrum of the last frame.
     pub fn spec_enh(&self, c: usize) -> &[Complex32] {
         &self.channels[c].spec_enh

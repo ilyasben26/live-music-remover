@@ -1,0 +1,16 @@
+# For scripts/export_resemble_enhance.py (CPU-only torch is enough).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchaudio
+numpy
+scipy
+omegaconf
+rich
+matplotlib
+pandas
+tabulate
+tqdm
+soundfile
+onnx
+onnxslim
+onnxruntime

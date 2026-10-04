@@ -14,9 +14,11 @@
   ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
   <!-- ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyasben26/live-music-remover/total) -->
  <!-- ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ilyasben26/live-music-remover/rust.yml) -->
+
+  [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A0A21O64X2)
 </div>
 
-A real time-time audio processing tool that removes music and noise from a live audio stream while preserving speech. It uses the [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) model.
+A real time-time audio processing tool that removes music and noise from a live audio stream while preserving speech. It can use [Resemble Enhance](https://github.com/resemble-ai/resemble-enhance)'s denoiser (the default), [DPDFNet](https://github.com/ceva-ip/DPDFNet) or [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet).
 
 
 > Very Important Note (PLEASE READ): In some cases, Live Music Remover can let through short blips of music or very faint musical artifacts, but this rarely happens and only when the music is too loud while a person is speaking. Furthermore, the blips don't form any coherent melody and are only perceptible when using headphones, if you notice them, try playing the audio through speakers, that should limit your perception of it. You have been warned. If I can, I will continue to monitor advances in this noise/music removal field and implement them on this project. If you know how to improve Live Music Remover, please open an issue or a pull request, any help will be appreciated. This project is a work in progress, there are bugs, if you encounter one, just close the app and open it again and that should fix it, and also make sure to open an issue on Github [here](https://github.com/ilyasben26/live-music-remover/issues) where you explain the bug so that I can fix it.
@@ -27,7 +29,7 @@ A real time-time audio processing tool that removes music and noise from a live 
 ## Demo
 todo!
 
-## How To Use For Removing Music From The System's Audio
+## Instructions
 
 <!-- Watch the tutorial video: TODO!(insert video link) -->
 <!-- todo!(add pictures to the steps below to make it clearer) -->
@@ -80,5 +82,17 @@ cargo +nightly build -p live-music-remover --features "ui,dev-console" --bin liv
     year = {2023},
   }
   ```
+- DPDFNet Repo: https://github.com/ceva-ip/DPDFNet (models: https://huggingface.co/Ceva-IP/DPDFNet, Apache-2.0). The DPDFNet-2 and DPDFNet-8 48 kHz HR models are bundled as ONNX, and the streaming code in `src/dpdfnet.rs` is a Rust port of the reference `StreamEnhancer`.
+- DPDFNet citation:
+  ```bibtex
+  @article{rika2025dpdfnet,
+    title  = {DPDFNet: Boosting DeepFilterNet2 via Dual-Path RNN},
+    author = {Rika, Daniel and Sapir, Nino and Gus, Ido},
+    journal = {arXiv preprint arXiv:2512.16420},
+    year   = {2025}
+  }
+  ```
+- Resemble Enhance Repo: https://github.com/resemble-ai/resemble-enhance (weights: https://huggingface.co/ResembleAI/resemble-enhance, MIT, © 2023 Resemble AI). Only the denoiser is used: it is exported from the `enhancer_stage2` checkpoint to ONNX with `scripts/export_resemble_enhance.py` and bundled as `models/resemble_denoiser.onnx`.
+- DPDFNet and Resemble Enhance run on [ONNX Runtime](https://onnxruntime.ai) through the [`ort`](https://github.com/pykeio/ort) crate (Resemble Enhance uses its DirectML execution provider for the GPU).
 
 

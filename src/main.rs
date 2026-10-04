@@ -20,12 +20,17 @@ mod cmap;
 mod devices;
 mod dpdfnet;
 mod dpdfnet_capture;
+mod noise;
 mod notify_update;
+mod resemble;
+mod resemble_capture;
 mod volume;
 mod win_notification;
 use capture::{ModelKind, *};
 use dpdfnet::DpdfModelKind;
 use dpdfnet_capture::DpdfNetCapture;
+use noise::NoiseControls;
+use resemble_capture::ResembleCapture;
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
@@ -117,20 +122,37 @@ pub fn main() -> eframe::Result<()> {
 enum ModelChoice {
     DeepFilter(ModelKind),
     DpdfNet(DpdfModelKind),
+    Resemble,
 }
 
 impl ModelChoice {
-    const ALL: [ModelChoice; 4] = [
+    const ALL: [ModelChoice; 5] = [
         ModelChoice::DeepFilter(ModelKind::Standard),
         ModelChoice::DeepFilter(ModelKind::LowLatency),
         ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr),
         ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr),
+        ModelChoice::Resemble,
     ];
 
+    /// Name shown in the UI, with latency, music removal and device hints
+    /// (delays measured on an RTX 3060 laptop).
     fn label(self) -> &'static str {
         match self {
-            ModelChoice::DeepFilter(k) => k.label(),
-            ModelChoice::DpdfNet(k) => k.label(),
+            ModelChoice::DeepFilter(ModelKind::Standard) => {
+                "DeepFilterNet3 (low latency) (CPU)"
+            }
+            ModelChoice::DeepFilter(ModelKind::LowLatency) => {
+                "DeepFilterNet3 LL (lowest latency) (CPU)"
+            }
+            ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr) => {
+                "DPDFNet-2 48 kHz HR (low latency) (CPU)"
+            }
+            ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr) => {
+                "DPDFNet-8 48 kHz HR (better removal) (CPU)"
+            }
+            ModelChoice::Resemble => {
+                "Resemble Enhance (best removal) (high latency) (GPU)"
+            }
         }
     }
 
@@ -142,6 +164,7 @@ impl ModelChoice {
 enum CaptureWorker {
     DeepFilter(DeepFilterCapture),
     DpdfNet(DpdfNetCapture),
+    Resemble(ResembleCapture),
 }
 
 impl CaptureWorker {
@@ -149,7 +172,27 @@ impl CaptureWorker {
         match self {
             CaptureWorker::DeepFilter(w) => w.should_stop(),
             CaptureWorker::DpdfNet(w) => w.should_stop(),
+            CaptureWorker::Resemble(w) => w.should_stop(),
         }
+    }
+
+    /// Whether the model runs on the GPU. DeepFilterNet (tract) and DPDFNet
+    /// (ONNX Runtime CPU sessions) always run on the CPU.
+    fn on_gpu(&self) -> bool {
+        match self {
+            CaptureWorker::DeepFilter(_) | CaptureWorker::DpdfNet(_) => false,
+            CaptureWorker::Resemble(w) => w.on_gpu,
+        }
+    }
+
+    /// Current estimate of the input-to-output delay, 0 until known.
+    fn delay_ms(&self) -> u32 {
+        let delay = match self {
+            CaptureWorker::DeepFilter(w) => &w.delay_ms,
+            CaptureWorker::DpdfNet(w) => &w.delay_ms,
+            CaptureWorker::Resemble(w) => &w.delay_ms,
+        };
+        delay.load(Ordering::Relaxed)
     }
 }
 
@@ -186,6 +229,12 @@ struct LiveMusicRemover {
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
     smoother_enabled: Arc<AtomicBool>,
+    /// Run Resemble Enhance on the GPU (falls back to the CPU if unavailable).
+    resemble_use_gpu: bool,
+    /// Experimental input / comfort noise, shared with the running pipeline.
+    noise: NoiseControls,
+    input_noise_db: f32,
+    comfort_noise_db: f32,
     selected_model: ModelChoice,
     dark_mode: bool,
     last_dark_mode: bool,
@@ -361,8 +410,12 @@ impl LiveMusicRemover {
             shared_volume,
             system_volume: 1.0,
             smoother_enabled: Arc::new(AtomicBool::new(true)),
+            resemble_use_gpu: true,
+            noise: NoiseControls::default(),
+            input_noise_db: noise::OFF_DB,
+            comfort_noise_db: noise::OFF_DB,
             freq_axis_scale: 1.5,
-            selected_model: ModelChoice::DeepFilter(ModelKind::default()),
+            selected_model: ModelChoice::Resemble,
             dark_mode: true,
             last_dark_mode: true,
             router: None,
@@ -490,6 +543,7 @@ impl LiveMusicRemover {
                 Some(s_device_event),
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
+                self.noise.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DeepFilter(w))),
             ModelChoice::DpdfNet(kind) => DpdfNetCapture::new(
@@ -502,8 +556,22 @@ impl LiveMusicRemover {
                 Some(s_device_event),
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
+                self.noise.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DpdfNet(w))),
+            ModelChoice::Resemble => ResembleCapture::new(
+                input_device,
+                output_device,
+                Some(s_noisy),
+                Some(s_enh),
+                Some(r_controls),
+                Some(s_device_event),
+                self.shared_volume.clone(),
+                self.smoother_enabled.clone(),
+                self.resemble_use_gpu,
+                self.noise.clone(),
+            )
+            .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::Resemble(w))),
         };
         match result {
             Ok((sr, frame_size, freq_size, df_worker)) => {
@@ -522,7 +590,7 @@ impl LiveMusicRemover {
                 self.r_device_event = Some(r_device_event);
                 // Push current slider values so a fresh start actually honors them:
                 // init_df builds DeepFilterNet with post-filtering off, and DPDFNet
-                // starts without an attenuation limit.
+                // and Resemble Enhance start without an attenuation limit.
                 if self.selected_model.is_deep_filter() {
                     self.s_controls
                         .send((DfControl::PostFilterBeta, self.post_filter_beta))
@@ -587,6 +655,59 @@ impl LiveMusicRemover {
                 None
             }
         };
+    }
+
+    /// Resemble Enhance device choice, then where the running model runs and
+    /// the current delay.
+    fn model_status_ui(&mut self, ui: &mut egui::Ui) {
+        if self.selected_model == ModelChoice::Resemble {
+            ui.add_space(4.0);
+            if ui
+                .checkbox(&mut self.resemble_use_gpu, "Use GPU")
+                .on_hover_text(
+                    "On: runs on the GPU (DirectX 12) with about 0.4 s of delay, falling \
+                     back to the CPU if no GPU is usable. Off: runs on the CPU with about \
+                     1.2 s of delay and keeps up to four cores busy.",
+                )
+                .changed()
+                && self.df_worker.is_some()
+            {
+                // Restart so the new device takes effect.
+                self.stop_capture();
+                let inp = self.input_device.clone();
+                let out = self.output_device.clone();
+                self.start_capture(inp, out);
+            }
+        }
+        if let Some(w) = self.df_worker.as_ref() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Running on:");
+                if w.on_gpu() {
+                    ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "GPU (DirectML)");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(160, 160, 160), "CPU");
+                }
+                let delay_ms = w.delay_ms();
+                if delay_ms > 0 {
+                    ui.label(format!("·  Delay ≈ {delay_ms} ms")).on_hover_text(
+                        "Estimated time from input to output: the model's own delay plus \
+                         the audio buffered on each side. Excludes the audio devices' \
+                         internal buffers.",
+                    );
+                }
+            });
+        }
+        if self.selected_model == ModelChoice::Resemble {
+            ui.label(
+                egui::RichText::new(
+                    "Resemble Enhance processes audio in blocks: adds about 0.4 s of delay \
+                     on the GPU, 1.2 s on the CPU.",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        }
     }
 
     fn auto_select_output_device(&mut self) {
@@ -1039,6 +1160,7 @@ impl eframe::App for LiveMusicRemover {
                         //         "Stop capturing to change model.",
                         //     );
                         // }
+                        self.model_status_ui(ui);
                     });
 
                     ui.add_space(8.0);
@@ -1144,6 +1266,58 @@ impl eframe::App for LiveMusicRemover {
                                 {
                                     self.smoother_enabled
                                         .store(smoother_on, Ordering::Relaxed);
+                                }
+
+                                // Experimental: noise before / after the model.
+                                let db_text = |v: f64, _: std::ops::RangeInclusive<usize>| {
+                                    if v <= noise::OFF_DB as f64 {
+                                        "Off".to_string()
+                                    } else {
+                                        format!("{v:.0}")
+                                    }
+                                };
+                                ui.add_space(4.0);
+                                ui.label("Input Noise [dB]");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.input_noise_db,
+                                            noise::OFF_DB..=-10.0,
+                                        )
+                                        .step_by(1.0)
+                                        .custom_formatter(db_text),
+                                    )
+                                    .on_hover_text(
+                                        "Experimental. Adds pink noise to the audio before the \
+                                         model, relative to the input level. Far left is off.",
+                                    )
+                                    .changed()
+                                {
+                                    self.noise
+                                        .input_db
+                                        .store(self.input_noise_db.to_bits(), Ordering::Relaxed);
+                                }
+                                ui.add_space(4.0);
+                                ui.label("Comfort Noise [dB]");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.comfort_noise_db,
+                                            noise::OFF_DB..=-20.0,
+                                        )
+                                        .step_by(1.0)
+                                        .custom_formatter(db_text),
+                                    )
+                                    .on_hover_text(
+                                        "Adds faint pink noise after the model, relative to the \
+                                         input level, to mask musical artefacts. Around -50 dB \
+                                         hid them in offline tests. Far left is off.",
+                                    )
+                                    .changed()
+                                {
+                                    self.noise
+                                        .comfort_db
+                                        .store(self.comfort_noise_db.to_bits(), Ordering::Relaxed);
                                 }
 
                                 // ui.label("Threshold Min [dB]");
@@ -1340,7 +1514,8 @@ fn about_route() -> impl Route<LiveMusicRemover> {
             ui.add_space(4.0);
             ui.label("• DeepFilterNet  — neural network for music/noise suppression");
             ui.label("• DPDFNet        — speech enhancement model by Ceva (Apache-2.0)");
-            ui.label("• ONNX Runtime   — inference engine for DPDFNet");
+            ui.label("• Resemble Enhance — speech denoiser by Resemble AI (MIT)");
+            ui.label("• ONNX Runtime   — inference engine for DPDFNet and Resemble Enhance");
             ui.label("• egui / eframe  — immediate-mode GUI framework");
             ui.label("• cpal           — cross-platform audio I/O");
             ui.label("• rubato         — high-quality audio resampling");
@@ -1397,10 +1572,14 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label(egui::RichText::new("Step 4 — Choose a model").strong());
             ui.add_space(4.0);
             ui.label("• Standard");
-            ui.label("• Low Latency - Recommended.");
+            ui.label("• Low Latency");
             ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
             ui.label(
                 "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
+            );
+            ui.label(
+                "• Resemble Enhance - Recommended (default). Resemble AI's speech denoiser. Runs on the GPU \
+                 when available (about 0.4 s of delay) or on the CPU (about 1.2 s).",
             );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",
