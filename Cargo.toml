@@ -56,6 +56,14 @@ windows = { version = "0.58", features = [
     "Data_Xml_Dom",
     "Win32_System_Registry",
 ] }
+# DPDFNet inference. Pyke's prebuilt onnxruntime is linked statically, so no DLL ships.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+  "std",
+  "download-binaries",
+  "tls-native",
+  "api-17",
+] }
+realfft = "3.5"
 
 [build-dependencies]
 resvg = "0.37"
