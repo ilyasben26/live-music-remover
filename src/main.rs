@@ -132,11 +132,25 @@ impl ModelChoice {
         ModelChoice::Resemble,
     ];
 
+    /// Name shown in the UI, with latency, music removal and device hints
+    /// (delays measured on an RTX 3060 laptop).
     fn label(self) -> &'static str {
         match self {
-            ModelChoice::DeepFilter(k) => k.label(),
-            ModelChoice::DpdfNet(k) => k.label(),
-            ModelChoice::Resemble => "Resemble Enhance 44.1 kHz",
+            ModelChoice::DeepFilter(ModelKind::Standard) => {
+                "DeepFilterNet3 (low latency) (CPU)"
+            }
+            ModelChoice::DeepFilter(ModelKind::LowLatency) => {
+                "DeepFilterNet3 LL (lowest latency) (CPU)"
+            }
+            ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr) => {
+                "DPDFNet-2 48 kHz HR (low latency) (CPU)"
+            }
+            ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr) => {
+                "DPDFNet-8 48 kHz HR (better removal) (CPU)"
+            }
+            ModelChoice::Resemble => {
+                "Resemble Enhance (best removal) (high latency) (GPU)"
+            }
         }
     }
 
@@ -213,6 +227,8 @@ struct LiveMusicRemover {
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
     smoother_enabled: Arc<AtomicBool>,
+    /// Run Resemble Enhance on the GPU (falls back to the CPU if unavailable).
+    resemble_use_gpu: bool,
     selected_model: ModelChoice,
     dark_mode: bool,
     last_dark_mode: bool,
@@ -388,6 +404,7 @@ impl LiveMusicRemover {
             shared_volume,
             system_volume: 1.0,
             smoother_enabled: Arc::new(AtomicBool::new(true)),
+            resemble_use_gpu: true,
             freq_axis_scale: 1.5,
             selected_model: ModelChoice::DeepFilter(ModelKind::default()),
             dark_mode: true,
@@ -540,6 +557,7 @@ impl LiveMusicRemover {
                 Some(s_device_event),
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
+                self.resemble_use_gpu,
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::Resemble(w))),
         };
@@ -627,8 +645,28 @@ impl LiveMusicRemover {
         };
     }
 
-    /// Where the running model runs and the current delay.
-    fn model_status_ui(&self, ui: &mut egui::Ui) {
+    /// Resemble Enhance device choice, then where the running model runs and
+    /// the current delay.
+    fn model_status_ui(&mut self, ui: &mut egui::Ui) {
+        if self.selected_model == ModelChoice::Resemble {
+            ui.add_space(4.0);
+            if ui
+                .checkbox(&mut self.resemble_use_gpu, "Use GPU")
+                .on_hover_text(
+                    "On: runs on the GPU (DirectX 12) with about 0.4 s of delay, falling \
+                     back to the CPU if no GPU is usable. Off: runs on the CPU with about \
+                     1.2 s of delay and keeps up to four cores busy.",
+                )
+                .changed()
+                && self.df_worker.is_some()
+            {
+                // Restart so the new device takes effect.
+                self.stop_capture();
+                let inp = self.input_device.clone();
+                let out = self.output_device.clone();
+                self.start_capture(inp, out);
+            }
+        }
         if let Some(w) = self.df_worker.as_ref() {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -651,7 +689,8 @@ impl LiveMusicRemover {
         if self.selected_model == ModelChoice::Resemble {
             ui.label(
                 egui::RichText::new(
-                    "Resemble Enhance processes audio in blocks: adds about 0.4 s of delay.",
+                    "Resemble Enhance processes audio in blocks: adds about 0.4 s of delay \
+                     on the GPU, 1.2 s on the CPU.",
                 )
                 .small()
                 .color(egui::Color32::GRAY),
@@ -1475,8 +1514,8 @@ fn help_route() -> impl Route<LiveMusicRemover> {
                 "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
             );
             ui.label(
-                "• Resemble Enhance 44.1 kHz - Resemble AI's speech denoiser. Runs on the GPU \
-                 when available and adds about 0.4 s of delay.",
+                "• Resemble Enhance - Resemble AI's speech denoiser. Runs on the GPU \
+                 when available (about 0.4 s of delay) or on the CPU (about 1.2 s).",
             );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",

@@ -163,8 +163,12 @@ class DenoiserOnnx(nn.Module):
         re, im = self.stft(x / peak)
         re, im = re[..., :-1], im[..., :-1]
         mag = (re * re + im * im).sqrt()
-        phi = torch.atan2(im, re)
-        cos, sin = phi.cos(), phi.sin()
+        # cos / sin of the phase without atan2: its ONNX export divides 0 by 0
+        # (NaN on the CPU) for silent bins. torch.angle(0) is 0, so cos 1, sin 0.
+        nonzero = mag > 0
+        safe = mag.clamp_min(1e-30)
+        cos = torch.where(nonzero, re / safe, torch.ones_like(re))
+        sin = torch.where(nonzero, im / safe, torch.zeros_like(im))
         mag_mask, sin_res, cos_res = self.d._predict(mag, cos, sin)
         sm, sc, ss = self.d._separate(mag, cos, sin, mag_mask, cos_res, sin_res)
         re_o, im_o = sm * sc, sm * ss
@@ -236,6 +240,7 @@ def main():
     graph = DenoiserOnnx(denoiser, N).eval()
 
     x = torch.randn(1, N) * 0.1
+    x[:, : N // 3] = 0  # digital silence must not produce NaN
     with torch.inference_mode():
         peak = x.abs().max()
         ref = denoiser(x / peak) * peak

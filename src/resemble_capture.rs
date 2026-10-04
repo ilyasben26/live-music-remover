@@ -2,7 +2,7 @@
 //!
 //! Kept separate from the DeepFilterNet and DPDFNet pipelines: it owns its own
 //! device streams, worker thread and model. The model is mono and processes
-//! `resemble::BLOCK`-sample blocks, so input is downmixed to mono and the
+//! fixed-size blocks, so input is downmixed to mono and the
 //! output is copied to every output channel.
 
 use std::sync::{
@@ -24,7 +24,7 @@ use crate::capture::{
     DeviceEvent, DeviceSelectError, DfControl, RbCons, RbProd, RecvControl, SendDeviceEvent,
     SendSpec, StreamStats,
 };
-use crate::resemble::{ResembleDenoiser, BLOCK, HOP, LOOKAHEAD, SAMPLE_RATE};
+use crate::resemble::{ResembleDenoiser, HOP, LOOKAHEAD, SAMPLE_RATE};
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 /// Spectrogram FFT size: two hops, so one display frame per model hop.
@@ -327,6 +327,7 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
+        let block = self.model.block();
         let mut input_resampler = (self.input_sr != SAMPLE_RATE).then(|| {
             FftFixedOut::<f32>::new(self.input_sr, SAMPLE_RATE, HOP, 1, 1)
                 .expect("Failed to init input resampler")
@@ -348,9 +349,9 @@ impl Worker {
                 .as_ref()
                 .map_or(HOP, |r| r.output_frames_max())
         ]];
-        let mut block_in: Vec<f32> = Vec::with_capacity(BLOCK);
-        let mut block_out = vec![0.0f32; BLOCK];
-        let mut out = Vec::with_capacity(BLOCK * 2);
+        let mut block_in: Vec<f32> = Vec::with_capacity(block);
+        let mut block_out = vec![0.0f32; block];
+        let mut out = Vec::with_capacity(block * 2);
 
         let mut planner = RealFftPlanner::<f32>::new();
         let mut spec_noisy = SpecAnalyzer::new(&mut planner);
@@ -403,7 +404,7 @@ impl Worker {
                 }
                 None => block_in.extend_from_slice(&resample_in[..HOP]),
             }
-            if block_in.len() < BLOCK {
+            if block_in.len() < block {
                 continue;
             }
 
@@ -414,7 +415,7 @@ impl Worker {
             }
             let elapsed = t0.elapsed().as_secs_f32();
             // Decays with a half-life of about 30 s.
-            let decay = 0.5f32.powf(BLOCK as f32 / SAMPLE_RATE as f32 / 30.0);
+            let decay = 0.5f32.powf(block as f32 / SAMPLE_RATE as f32 / 30.0);
             compute_peak = elapsed.max(compute_peak * decay);
             block_in.clear();
 
@@ -467,7 +468,7 @@ impl Worker {
             }
             // A sample waits for its block and the lookahead, then the model,
             // then the audio queued ahead of it.
-            let delay_s = (BLOCK + LOOKAHEAD) as f32 / SAMPLE_RATE as f32
+            let delay_s = (block + LOOKAHEAD) as f32 / SAMPLE_RATE as f32
                 + elapsed
                 + ahead as f32 / self.output_sr as f32;
             self.delay_ms
@@ -521,19 +522,21 @@ impl ResembleCapture {
         s_device_event: Option<SendDeviceEvent>,
         shared_volume: Arc<AtomicU32>,
         smoother_enabled: Arc<AtomicBool>,
+        use_gpu: bool,
     ) -> Result<Self> {
         let in_dev = find_device(input_device, Direction::Input)?;
         let out_dev = find_device(output_device, Direction::Output)?;
         let in_cfg = stream_config(&in_dev, Direction::Input)?;
         let out_cfg = stream_config(&out_dev, Direction::Output)?;
 
-        let mut model = ResembleDenoiser::new()?;
+        let mut model = ResembleDenoiser::new(use_gpu)?;
         let on_gpu = model.on_gpu();
         let delay_ms = Arc::new(AtomicU32::new(0));
         // Warm up: the first runs pay session initialisation (and are slow on DirectML).
-        let mut warm = vec![0.0f32; BLOCK];
+        let block = model.block();
+        let mut warm = vec![0.0f32; block];
         for _ in 0..2 {
-            model.process(&vec![0.0; BLOCK], &mut warm)?;
+            model.process(&vec![0.0; block], &mut warm)?;
         }
         model.reset();
 
