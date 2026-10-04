@@ -61,8 +61,8 @@ const MODEL_LOW_LATENCY: &[u8] = include_bytes!("../models/DeepFilterNet3_ll_onn
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ModelKind {
-    Standard,
     #[default]
+    Standard,
     LowLatency,
 }
 
@@ -115,7 +115,9 @@ fn init_df(model_kind: ModelKind, channels: usize) -> (usize, usize, usize) {
     };
     log::debug!("Loading embedded model: {}", model_kind.label());
     let df_params = DfParams::from_bytes(model_bytes).expect("Failed to load embedded DF model");
-    let r_params = RuntimeParams::default_with_ch(channels);
+    let r_params = RuntimeParams::default_with_ch(channels)
+        .with_thresholds(-15., 35., 35.)
+        .with_mask_reduce(ReduceMask::MAX);
     let df = DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
     let (sr, frame_size, freq_size) = (df.sr, df.hop_size, df.n_freqs);
     unsafe {
@@ -522,6 +524,7 @@ fn get_worker_fn(
     controls: AtomicControls,
     df_com: Option<GuiCom>,
     shared_volume: Arc<AtomicU32>,
+    smoother_enabled: Arc<AtomicBool>,
 ) -> impl FnMut() {
     let (has_init, should_stop, device_lost) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
@@ -559,6 +562,18 @@ fn get_worker_fn(
         let mut interleaved_in = vec![0.0; n_in * ch];
         let mut interleaved_out = vec![0.0; n_out * ch];
         let mut resampled_in = vec![vec![0.0; df.hop_size]; ch];
+        // Transient smoother state: ducks short loud spikes (musical-noise blips)
+        // relative to the recently-typical level, then releases gradually.
+        // `env` tracks the sustained level; `gain` is the (slew-limited) correction
+        // applied on top of DF's own output.
+        let per_sample_coeff = |tau_s: f32| (-1.0 / (tau_s * output_sr as f32)).exp();
+        let env_attack = per_sample_coeff(0.030);
+        let env_release = per_sample_coeff(0.300);
+        let gain_attack = per_sample_coeff(0.003);
+        let gain_release = per_sample_coeff(0.080);
+        const SPIKE_THRESH_DB: f32 = 6.0;
+        let mut env: f32 = -1.0; // lazily seeded from the first processed frame
+        let mut gain: f32 = 1.0;
         while !should_stop.load(Ordering::Relaxed) && !device_lost.load(Ordering::Relaxed) {
             if rb_in.len() < n_in * ch {
                 // Sleep for half a hop size
@@ -606,6 +621,34 @@ fn get_worker_fn(
                 }
             } else {
                 planar_to_interleaved(outframe.as_slice().unwrap(), ch, &mut interleaved_out);
+            }
+            for frame in interleaved_out.chunks_mut(ch) {
+                let level = frame.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+                if env < 0.0 {
+                    env = level.max(1e-8);
+                }
+                env = if level > env {
+                    env * env_attack + level * (1.0 - env_attack)
+                } else {
+                    env * env_release + level * (1.0 - env_release)
+                };
+                let level_db = 20.0 * (level.max(1e-8) / env.max(1e-8)).log10();
+                let target_gain = if level_db > SPIKE_THRESH_DB {
+                    10f32.powf(-(level_db - SPIKE_THRESH_DB) / 20.0)
+                } else {
+                    1.0
+                };
+                let coeff = if target_gain < gain {
+                    gain_attack
+                } else {
+                    gain_release
+                };
+                gain = gain * coeff + target_gain * (1.0 - coeff);
+                if smoother_enabled.load(Ordering::Relaxed) {
+                    for s in frame.iter_mut() {
+                        *s *= gain;
+                    }
+                }
             }
             // Apply Windows master volume (and mute) to every output sample.
             let vol = f32::from_bits(shared_volume.load(Ordering::Relaxed));
@@ -693,6 +736,7 @@ impl Default for DeepFilterCapture {
             None,
             None,
             Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicBool::new(true)),
         )
         .expect("Error during DeepFilterCapture initialization")
     }
@@ -708,6 +752,7 @@ impl DeepFilterCapture {
         r_opt: Option<RecvControl>,
         s_device_event: Option<SendDeviceEvent>,
         shared_volume: Arc<AtomicU32>,
+        smoother_enabled: Arc<AtomicBool>,
     ) -> Result<Self> {
         let ch = PROCESS_CHANNELS;
         let (sr, frame_size, freq_size) = init_df(model_kind, ch);
@@ -751,6 +796,7 @@ impl DeepFilterCapture {
             controls,
             Some(df_com),
             shared_volume,
+            smoother_enabled,
         )));
         while !has_init.load(Ordering::Relaxed) {
             sleep(Duration::from_secs_f32(0.01));
