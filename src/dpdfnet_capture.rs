@@ -244,6 +244,7 @@ struct Worker {
     shared_volume: Arc<AtomicU32>,
     smoother_enabled: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
+    delay_ms: Arc<AtomicU32>,
 }
 
 impl Worker {
@@ -275,6 +276,7 @@ impl Worker {
         let mut interleaved_in = vec![0.0; n_in * ch];
         let mut interleaved_out = vec![0.0; n_out * ch];
         let mut resampled_in = vec![vec![0.0; hop]; ch];
+        let mut smoothed_delay_s = 0.0f32;
 
         // Transient smoother, same tuning as the DeepFilterNet pipeline.
         let per_sample_coeff = |tau_s: f32| (-1.0 / (tau_s * self.output_sr as f32)).exp();
@@ -397,6 +399,18 @@ impl Worker {
                 self.rb_out.push_slice(&interleaved_out);
                 self.rb_out.sync();
             }
+            // Delay estimate for the UI: model lag, one frame of buffering, and
+            // the audio queued on both sides.
+            let delay_s = (m.delay_samples() + hop) as f32 / sr as f32
+                + self.rb_in.len() as f32 / ch as f32 / self.input_sr as f32
+                + self.rb_out.len() as f32 / ch as f32 / self.output_sr as f32;
+            smoothed_delay_s = if smoothed_delay_s == 0.0 {
+                delay_s
+            } else {
+                0.95 * smoothed_delay_s + 0.05 * delay_s
+            };
+            self.delay_ms
+                .store((smoothed_delay_s * 1000.0) as u32, Ordering::Relaxed);
 
             frames_since_report += 1;
             if frames_since_report * hop >= sr * 2 && log::log_enabled!(log::Level::Debug) {
@@ -434,6 +448,8 @@ pub struct DpdfNetCapture {
     worker_handle: Option<JoinHandle<()>>,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
+    /// Current estimate of the input-to-output delay.
+    pub delay_ms: Arc<AtomicU32>,
 }
 
 impl DpdfNetCapture {
@@ -469,6 +485,7 @@ impl DpdfNetCapture {
 
         let should_stop = Arc::new(AtomicBool::new(false));
         let device_lost = Arc::new(AtomicBool::new(false));
+        let delay_ms = Arc::new(AtomicU32::new(0));
         let stats = Arc::new(StreamStats::default());
         let worker = Worker {
             model,
@@ -483,6 +500,7 @@ impl DpdfNetCapture {
             shared_volume,
             smoother_enabled,
             stats: stats.clone(),
+            delay_ms: delay_ms.clone(),
         };
         let worker_handle = Some(
             thread::Builder::new()
@@ -518,6 +536,7 @@ impl DpdfNetCapture {
             worker_handle,
             input_stream: Some(input_stream),
             output_stream: Some(output_stream),
+            delay_ms,
         })
     }
 

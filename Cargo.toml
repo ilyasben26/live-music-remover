@@ -62,6 +62,9 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
   "download-binaries",
   "tls-native",
   "api-17",
+  # Resemble Enhance runs on the GPU. Pyke's Windows build already includes
+  # DirectML; this only exposes its execution provider.
+  "directml",
 ] }
 realfft = "3.5"
 

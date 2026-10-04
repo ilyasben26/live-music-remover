@@ -21,11 +21,14 @@ mod devices;
 mod dpdfnet;
 mod dpdfnet_capture;
 mod notify_update;
+mod resemble;
+mod resemble_capture;
 mod volume;
 mod win_notification;
 use capture::{ModelKind, *};
 use dpdfnet::DpdfModelKind;
 use dpdfnet_capture::DpdfNetCapture;
+use resemble_capture::ResembleCapture;
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
@@ -117,20 +120,23 @@ pub fn main() -> eframe::Result<()> {
 enum ModelChoice {
     DeepFilter(ModelKind),
     DpdfNet(DpdfModelKind),
+    Resemble,
 }
 
 impl ModelChoice {
-    const ALL: [ModelChoice; 4] = [
+    const ALL: [ModelChoice; 5] = [
         ModelChoice::DeepFilter(ModelKind::Standard),
         ModelChoice::DeepFilter(ModelKind::LowLatency),
         ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr),
         ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr),
+        ModelChoice::Resemble,
     ];
 
     fn label(self) -> &'static str {
         match self {
             ModelChoice::DeepFilter(k) => k.label(),
             ModelChoice::DpdfNet(k) => k.label(),
+            ModelChoice::Resemble => "Resemble Enhance 44.1 kHz",
         }
     }
 
@@ -142,6 +148,7 @@ impl ModelChoice {
 enum CaptureWorker {
     DeepFilter(DeepFilterCapture),
     DpdfNet(DpdfNetCapture),
+    Resemble(ResembleCapture),
 }
 
 impl CaptureWorker {
@@ -149,7 +156,27 @@ impl CaptureWorker {
         match self {
             CaptureWorker::DeepFilter(w) => w.should_stop(),
             CaptureWorker::DpdfNet(w) => w.should_stop(),
+            CaptureWorker::Resemble(w) => w.should_stop(),
         }
+    }
+
+    /// Whether the model runs on the GPU. DeepFilterNet (tract) and DPDFNet
+    /// (ONNX Runtime CPU sessions) always run on the CPU.
+    fn on_gpu(&self) -> bool {
+        match self {
+            CaptureWorker::DeepFilter(_) | CaptureWorker::DpdfNet(_) => false,
+            CaptureWorker::Resemble(w) => w.on_gpu,
+        }
+    }
+
+    /// Current estimate of the input-to-output delay, 0 until known.
+    fn delay_ms(&self) -> u32 {
+        let delay = match self {
+            CaptureWorker::DeepFilter(w) => &w.delay_ms,
+            CaptureWorker::DpdfNet(w) => &w.delay_ms,
+            CaptureWorker::Resemble(w) => &w.delay_ms,
+        };
+        delay.load(Ordering::Relaxed)
     }
 }
 
@@ -504,6 +531,17 @@ impl LiveMusicRemover {
                 self.smoother_enabled.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DpdfNet(w))),
+            ModelChoice::Resemble => ResembleCapture::new(
+                input_device,
+                output_device,
+                Some(s_noisy),
+                Some(s_enh),
+                Some(r_controls),
+                Some(s_device_event),
+                self.shared_volume.clone(),
+                self.smoother_enabled.clone(),
+            )
+            .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::Resemble(w))),
         };
         match result {
             Ok((sr, frame_size, freq_size, df_worker)) => {
@@ -522,7 +560,7 @@ impl LiveMusicRemover {
                 self.r_device_event = Some(r_device_event);
                 // Push current slider values so a fresh start actually honors them:
                 // init_df builds DeepFilterNet with post-filtering off, and DPDFNet
-                // starts without an attenuation limit.
+                // and Resemble Enhance start without an attenuation limit.
                 if self.selected_model.is_deep_filter() {
                     self.s_controls
                         .send((DfControl::PostFilterBeta, self.post_filter_beta))
@@ -587,6 +625,38 @@ impl LiveMusicRemover {
                 None
             }
         };
+    }
+
+    /// Where the running model runs and the current delay.
+    fn model_status_ui(&self, ui: &mut egui::Ui) {
+        if let Some(w) = self.df_worker.as_ref() {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Running on:");
+                if w.on_gpu() {
+                    ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "GPU (DirectML)");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(160, 160, 160), "CPU");
+                }
+                let delay_ms = w.delay_ms();
+                if delay_ms > 0 {
+                    ui.label(format!("·  Delay ≈ {delay_ms} ms")).on_hover_text(
+                        "Estimated time from input to output: the model's own delay plus \
+                         the audio buffered on each side. Excludes the audio devices' \
+                         internal buffers.",
+                    );
+                }
+            });
+        }
+        if self.selected_model == ModelChoice::Resemble {
+            ui.label(
+                egui::RichText::new(
+                    "Resemble Enhance processes audio in blocks: adds about 0.9 s of delay.",
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        }
     }
 
     fn auto_select_output_device(&mut self) {
@@ -1039,6 +1109,7 @@ impl eframe::App for LiveMusicRemover {
                         //         "Stop capturing to change model.",
                         //     );
                         // }
+                        self.model_status_ui(ui);
                     });
 
                     ui.add_space(8.0);
@@ -1340,7 +1411,8 @@ fn about_route() -> impl Route<LiveMusicRemover> {
             ui.add_space(4.0);
             ui.label("• DeepFilterNet  — neural network for music/noise suppression");
             ui.label("• DPDFNet        — speech enhancement model by Ceva (Apache-2.0)");
-            ui.label("• ONNX Runtime   — inference engine for DPDFNet");
+            ui.label("• Resemble Enhance — speech denoiser by Resemble AI (MIT)");
+            ui.label("• ONNX Runtime   — inference engine for DPDFNet and Resemble Enhance");
             ui.label("• egui / eframe  — immediate-mode GUI framework");
             ui.label("• cpal           — cross-platform audio I/O");
             ui.label("• rubato         — high-quality audio resampling");
@@ -1401,6 +1473,10 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
             ui.label(
                 "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
+            );
+            ui.label(
+                "• Resemble Enhance 44.1 kHz - Resemble AI's speech denoiser. Runs on the GPU \
+                 when available and adds about a second of delay.",
             );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",

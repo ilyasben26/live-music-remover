@@ -548,6 +548,7 @@ fn get_worker_fn(
     shared_volume: Arc<AtomicU32>,
     smoother_enabled: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
+    delay_ms: Arc<AtomicU32>,
 ) -> impl FnMut() {
     let (has_init, should_stop, device_lost) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
@@ -599,6 +600,7 @@ fn get_worker_fn(
         let mut gain: f32 = 1.0;
         let mut frames_since_report = 0usize;
         let mut dropped_frames = 0usize;
+        let mut smoothed_delay_s = 0.0f32;
         while !should_stop.load(Ordering::Relaxed) && !device_lost.load(Ordering::Relaxed) {
             let queued_in = rb_in.len();
             if queued_in < n_in * ch {
@@ -690,6 +692,18 @@ fn get_worker_fn(
                 rb_out.push_slice(&interleaved_out);
                 rb_out.sync();
             }
+            // Delay estimate for the UI: STFT and lookahead, one frame of
+            // buffering, and the audio queued on both sides.
+            let algo = df.fft_size - df.hop_size + (df.lookahead + 1) * df.hop_size;
+            let delay_s = algo as f32 / df.sr as f32
+                + rb_in.len() as f32 / ch as f32 / input_sr as f32
+                + rb_out.len() as f32 / ch as f32 / output_sr as f32;
+            smoothed_delay_s = if smoothed_delay_s == 0.0 {
+                delay_s
+            } else {
+                0.95 * smoothed_delay_s + 0.05 * delay_s
+            };
+            delay_ms.store((smoothed_delay_s * 1000.0) as u32, Ordering::Relaxed);
             frames_since_report += 1;
             if frames_since_report * df.hop_size >= df.sr * 2 && log::log_enabled!(log::Level::Debug)
             {
@@ -765,6 +779,8 @@ pub struct DeepFilterCapture {
     pub sr: usize,
     pub frame_size: usize,
     pub freq_size: usize,
+    /// Current estimate of the input-to-output delay.
+    pub delay_ms: Arc<AtomicU32>,
     should_stop: Arc<AtomicBool>,
     worker_handle: Option<JoinHandle<()>>,
     source: AudioSource,
@@ -822,6 +838,7 @@ impl DeepFilterCapture {
         let has_init = Arc::new(AtomicBool::new(false));
         let device_lost = Arc::new(AtomicBool::new(false));
         let stats = Arc::new(StreamStats::default());
+        let delay_ms = Arc::new(AtomicU32::new(0));
         let s_spec = match (s_noisy, s_enh) {
             (Some(n), Some(e)) => Some((n, e)),
             _ => None,
@@ -846,6 +863,7 @@ impl DeepFilterCapture {
             shared_volume,
             smoother_enabled,
             stats.clone(),
+            delay_ms.clone(),
         )));
         while !has_init.load(Ordering::Relaxed) {
             sleep(Duration::from_secs_f32(0.01));
@@ -861,6 +879,7 @@ impl DeepFilterCapture {
             sr,
             frame_size,
             freq_size,
+            delay_ms,
             should_stop,
             worker_handle,
             source,
