@@ -24,6 +24,7 @@ use crate::capture::{
     DeviceEvent, DeviceSelectError, DfControl, RbCons, RbProd, RecvControl, SendDeviceEvent,
     SendSpec, StreamStats,
 };
+use crate::noise::{NoiseControls, NoiseInjector};
 use crate::resemble::{ResembleDenoiser, HOP, LOOKAHEAD, SAMPLE_RATE};
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
@@ -322,6 +323,7 @@ struct Worker {
     shared_volume: Arc<AtomicU32>,
     smoother_enabled: Arc<AtomicBool>,
     delay_ms: Arc<AtomicU32>,
+    noise: NoiseControls,
     stats: Arc<StreamStats>,
 }
 
@@ -357,6 +359,7 @@ impl Worker {
         let mut spec_noisy = SpecAnalyzer::new(&mut planner);
         let mut spec_enh = SpecAnalyzer::new(&mut planner);
         let mut smoother = Smoother::new(self.output_sr);
+        let mut noise = NoiseInjector::new(self.noise.clone(), SAMPLE_RATE, 1);
         // Recent worst model time, to size the output margin. DirectML times
         // jitter with GPU clocks.
         let mut compute_peak = 0.0f32;
@@ -408,11 +411,13 @@ impl Worker {
                 continue;
             }
 
+            noise.process_input(&mut block_in);
             let t0 = Instant::now();
             if let Err(e) = self.model.process(&block_in, &mut block_out) {
                 log::error!("Resemble Enhance processing failed: {e:#}");
                 block_out.fill(0.0);
             }
+            noise.process_output(&mut block_out);
             let elapsed = t0.elapsed().as_secs_f32();
             // Decays with a half-life of about 30 s.
             let decay = 0.5f32.powf(block as f32 / SAMPLE_RATE as f32 / 30.0);
@@ -523,6 +528,7 @@ impl ResembleCapture {
         shared_volume: Arc<AtomicU32>,
         smoother_enabled: Arc<AtomicBool>,
         use_gpu: bool,
+        noise: NoiseControls,
     ) -> Result<Self> {
         let in_dev = find_device(input_device, Direction::Input)?;
         let out_dev = find_device(output_device, Direction::Output)?;
@@ -562,6 +568,7 @@ impl ResembleCapture {
             shared_volume,
             smoother_enabled,
             delay_ms: delay_ms.clone(),
+            noise,
             stats: stats.clone(),
         };
         let worker_handle = Some(

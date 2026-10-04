@@ -20,6 +20,7 @@ mod cmap;
 mod devices;
 mod dpdfnet;
 mod dpdfnet_capture;
+mod noise;
 mod notify_update;
 mod resemble;
 mod resemble_capture;
@@ -28,6 +29,7 @@ mod win_notification;
 use capture::{ModelKind, *};
 use dpdfnet::DpdfModelKind;
 use dpdfnet_capture::DpdfNetCapture;
+use noise::NoiseControls;
 use resemble_capture::ResembleCapture;
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
@@ -229,6 +231,10 @@ struct LiveMusicRemover {
     smoother_enabled: Arc<AtomicBool>,
     /// Run Resemble Enhance on the GPU (falls back to the CPU if unavailable).
     resemble_use_gpu: bool,
+    /// Experimental input / comfort noise, shared with the running pipeline.
+    noise: NoiseControls,
+    input_noise_db: f32,
+    comfort_noise_db: f32,
     selected_model: ModelChoice,
     dark_mode: bool,
     last_dark_mode: bool,
@@ -405,6 +411,9 @@ impl LiveMusicRemover {
             system_volume: 1.0,
             smoother_enabled: Arc::new(AtomicBool::new(true)),
             resemble_use_gpu: true,
+            noise: NoiseControls::default(),
+            input_noise_db: noise::OFF_DB,
+            comfort_noise_db: noise::OFF_DB,
             freq_axis_scale: 1.5,
             selected_model: ModelChoice::DeepFilter(ModelKind::default()),
             dark_mode: true,
@@ -534,6 +543,7 @@ impl LiveMusicRemover {
                 Some(s_device_event),
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
+                self.noise.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DeepFilter(w))),
             ModelChoice::DpdfNet(kind) => DpdfNetCapture::new(
@@ -546,6 +556,7 @@ impl LiveMusicRemover {
                 Some(s_device_event),
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
+                self.noise.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DpdfNet(w))),
             ModelChoice::Resemble => ResembleCapture::new(
@@ -558,6 +569,7 @@ impl LiveMusicRemover {
                 self.shared_volume.clone(),
                 self.smoother_enabled.clone(),
                 self.resemble_use_gpu,
+                self.noise.clone(),
             )
             .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::Resemble(w))),
         };
@@ -1254,6 +1266,58 @@ impl eframe::App for LiveMusicRemover {
                                 {
                                     self.smoother_enabled
                                         .store(smoother_on, Ordering::Relaxed);
+                                }
+
+                                // Experimental: noise before / after the model.
+                                let db_text = |v: f64, _: std::ops::RangeInclusive<usize>| {
+                                    if v <= noise::OFF_DB as f64 {
+                                        "Off".to_string()
+                                    } else {
+                                        format!("{v:.0}")
+                                    }
+                                };
+                                ui.add_space(4.0);
+                                ui.label("Input Noise [dB]");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.input_noise_db,
+                                            noise::OFF_DB..=-10.0,
+                                        )
+                                        .step_by(1.0)
+                                        .custom_formatter(db_text),
+                                    )
+                                    .on_hover_text(
+                                        "Experimental. Adds pink noise to the audio before the \
+                                         model, relative to the input level. Far left is off.",
+                                    )
+                                    .changed()
+                                {
+                                    self.noise
+                                        .input_db
+                                        .store(self.input_noise_db.to_bits(), Ordering::Relaxed);
+                                }
+                                ui.add_space(4.0);
+                                ui.label("Comfort Noise [dB]");
+                                if ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.comfort_noise_db,
+                                            noise::OFF_DB..=-20.0,
+                                        )
+                                        .step_by(1.0)
+                                        .custom_formatter(db_text),
+                                    )
+                                    .on_hover_text(
+                                        "Adds faint pink noise after the model, relative to the \
+                                         input level, to mask musical artefacts. Around -50 dB \
+                                         hid them in offline tests. Far left is off.",
+                                    )
+                                    .changed()
+                                {
+                                    self.noise
+                                        .comfort_db
+                                        .store(self.comfort_noise_db.to_bits(), Ordering::Relaxed);
                                 }
 
                                 // ui.label("Threshold Min [dB]");

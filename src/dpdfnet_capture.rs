@@ -22,6 +22,7 @@ use crate::capture::{
     SendDeviceEvent, SendSpec, StreamStats,
 };
 use crate::dpdfnet::{DpdfModelKind, DpdfNet};
+use crate::noise::{NoiseControls, NoiseInjector};
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 const PROCESS_CHANNELS: usize = 2;
@@ -245,6 +246,7 @@ struct Worker {
     smoother_enabled: Arc<AtomicBool>,
     stats: Arc<StreamStats>,
     delay_ms: Arc<AtomicU32>,
+    noise: NoiseControls,
 }
 
 impl Worker {
@@ -277,6 +279,7 @@ impl Worker {
         let mut interleaved_out = vec![0.0; n_out * ch];
         let mut resampled_in = vec![vec![0.0; hop]; ch];
         let mut smoothed_delay_s = 0.0f32;
+        let mut noise = NoiseInjector::new(self.noise.clone(), sr, ch);
 
         // Transient smoother, same tuning as the DeepFilterNet pipeline.
         let per_sample_coeff = |tau_s: f32| (-1.0 / (tau_s * self.output_sr as f32)).exp();
@@ -336,11 +339,13 @@ impl Worker {
                 }
             }
 
+            noise.process_input(&mut inframe);
             let result = m.process(&inframe, &mut outframe);
             if let Err(e) = result {
                 log::error!("DPDFNet processing failed: {e:#}");
                 outframe.fill(0.0);
             }
+            noise.process_output(&mut outframe);
 
             if let Some((ref mut r, ref mut buf)) = output_resampler.as_mut() {
                 let rows: Vec<&[f32]> = outframe.chunks_exact(hop).collect();
@@ -464,6 +469,7 @@ impl DpdfNetCapture {
         s_device_event: Option<SendDeviceEvent>,
         shared_volume: Arc<AtomicU32>,
         smoother_enabled: Arc<AtomicBool>,
+        noise: NoiseControls,
     ) -> Result<Self> {
         let ch = PROCESS_CHANNELS;
         let mut model = DpdfNet::new(model_kind, ch)?;
@@ -501,6 +507,7 @@ impl DpdfNetCapture {
             smoother_enabled,
             stats: stats.clone(),
             delay_ms: delay_ms.clone(),
+            noise,
         };
         let worker_handle = Some(
             thread::Builder::new()
