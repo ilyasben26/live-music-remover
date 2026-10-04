@@ -4,7 +4,7 @@
 //! own device streams, worker thread and model instance.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 use std::thread::{self, sleep, JoinHandle};
@@ -18,27 +18,13 @@ use ringbuf::HeapRb;
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
 
 use crate::capture::{
-    DeviceEvent, DeviceSelectError, DfControl, RbCons, RbProd, RecvControl, SendDeviceEvent,
-    SendSpec,
+    max_output_queue, DeviceEvent, DeviceSelectError, DfControl, RbCons, RbProd, RecvControl,
+    SendDeviceEvent, SendSpec, StreamStats,
 };
 use crate::dpdfnet::{DpdfModelKind, DpdfNet};
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 const PROCESS_CHANNELS: usize = 2;
-
-/// Shared between the device callbacks and the worker to keep latency bounded.
-///
-/// The callbacks never block: the output plays silence when it runs dry and the
-/// input drops samples when its queue is full. A block-waiting callback lets
-/// audio pile up in the queues (e.g. while the other device starts, or from
-/// clock drift between devices) and that backlog never drains.
-#[derive(Default)]
-struct StreamStats {
-    /// Largest output callback seen, in frames.
-    out_callback_frames: AtomicUsize,
-    underruns: AtomicUsize,
-    input_overflows: AtomicUsize,
-}
 
 #[derive(Clone, Copy)]
 enum Direction {
@@ -402,15 +388,9 @@ impl Worker {
             for s in interleaved_out.iter_mut() {
                 *s *= vol;
             }
-            // Keep the output queue near what the device needs per callback, plus
-            // jitter margin. Anything above that is pure latency, so drop this frame.
-            let cb = self
-                .stats
-                .out_callback_frames
-                .load(Ordering::Relaxed)
-                .max(n_out);
-            let max_queued = (2 * cb + 2 * n_out) * ch;
-            if self.rb_out.len() + interleaved_out.len() > max_queued {
+            // Drop this frame rather than queue more than the device needs.
+            if self.rb_out.len() + interleaved_out.len() > max_output_queue(&self.stats, n_out, ch)
+            {
                 dropped_frames += 1;
             } else {
                 self.rb_out.push_slice(&interleaved_out);

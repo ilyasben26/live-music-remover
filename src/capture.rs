@@ -17,7 +17,7 @@ use std::fmt::Display;
 use std::io::{self, stdout, Write};
 use std::mem::MaybeUninit;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     Arc, Once,
 };
 use std::thread::{self, sleep, JoinHandle};
@@ -77,6 +77,30 @@ impl ModelKind {
 
 const SAMPLE_FORMAT: cpal::SampleFormat = cpal::SampleFormat::F32;
 const PROCESS_CHANNELS: usize = 2;
+
+/// Shared between the device callbacks and the worker to keep latency bounded.
+///
+/// The callbacks never block: the output plays silence when it runs dry and the
+/// input drops samples when its queue is full. A block-waiting callback lets
+/// audio pile up in the queues (e.g. while the other device starts, or from
+/// clock drift between devices) and that backlog never drains.
+#[derive(Default)]
+pub(crate) struct StreamStats {
+    /// Largest output callback seen, in frames.
+    pub out_callback_frames: AtomicUsize,
+    pub underruns: AtomicUsize,
+    pub input_overflows: AtomicUsize,
+}
+
+/// Most samples worth queueing for the output device: two of its callbacks plus
+/// two worker frames of jitter margin. Anything above that is pure latency.
+pub(crate) fn max_output_queue(stats: &StreamStats, frames_per_push: usize, ch: usize) -> usize {
+    let cb = stats
+        .out_callback_frames
+        .load(Ordering::Relaxed)
+        .max(frames_per_push);
+    (2 * cb + 2 * frames_per_push) * ch
+}
 
 pub struct AudioSink {
     stream: Option<Stream>,
@@ -310,6 +334,7 @@ impl AudioSink {
         &mut self,
         mut rb: RbCons,
         model_ch: usize,
+        stats: Arc<StreamStats>,
         device_lost: Arc<AtomicBool>,
     ) -> Result<()> {
         let output_ch = self.config.channels as usize;
@@ -318,21 +343,22 @@ impl AudioSink {
         let stream = self.device.build_output_stream(
             &self.config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if output_ch == model_ch {
-                    let mut n = 0;
-                    while n < data.len() {
-                        n += rb.pop_slice(&mut data[n..]);
-                    }
-                    debug_assert_eq!(n, data.len());
+                let n_frames = data.len() / output_ch;
+                stats
+                    .out_callback_frames
+                    .fetch_max(n_frames, Ordering::Relaxed);
+                let complete = if output_ch == model_ch {
+                    let n = rb.pop_slice(data);
+                    data[n..].fill(0.0);
+                    n == data.len()
                 } else {
-                    let n_frames = data.len() / output_ch;
                     let mut rb_data = vec![0.0; n_frames * model_ch];
-                    let mut n = 0;
-                    while n < rb_data.len() {
-                        n += rb.pop_slice(&mut rb_data[n..]);
-                    }
-                    debug_assert_eq!(n, rb_data.len());
+                    let n = rb.pop_slice(&mut rb_data);
                     remap_interleaved_channels(&rb_data, model_ch, data, output_ch);
+                    n == rb_data.len()
+                };
+                if !complete {
+                    stats.underruns.fetch_add(1, Ordering::Relaxed);
                 }
                 if log::log_enabled!(log::Level::Trace) {
                     log::trace!(
@@ -428,6 +454,7 @@ impl AudioSource {
         &mut self,
         mut rb: RbProd,
         model_ch: usize,
+        stats: Arc<StreamStats>,
         device_lost: Arc<AtomicBool>,
     ) -> Result<()> {
         let input_ch = self.config.channels as usize;
@@ -444,20 +471,15 @@ impl AudioSource {
                         df::rms(data.iter())
                     );
                 }
-                if input_ch == model_ch {
-                    let mut n = 0;
-                    while n < data.len() {
-                        n += rb.push_slice(&data[n..]);
-                    }
-                    debug_assert_eq!(n, data.len());
+                let complete = if input_ch == model_ch {
+                    rb.push_slice(data) == data.len()
                 } else {
                     let mut mapped = vec![0.0; n_frames * model_ch];
                     remap_interleaved_channels(data, input_ch, &mut mapped, model_ch);
-                    let mut n = 0;
-                    while n < mapped.len() {
-                        n += rb.push_slice(&mapped[n..]);
-                    }
-                    debug_assert_eq!(n, mapped.len());
+                    rb.push_slice(&mapped) == mapped.len()
+                };
+                if !complete {
+                    stats.input_overflows.fetch_add(1, Ordering::Relaxed);
                 }
                 rb.sync();
             },
@@ -525,6 +547,7 @@ fn get_worker_fn(
     df_com: Option<GuiCom>,
     shared_volume: Arc<AtomicU32>,
     smoother_enabled: Arc<AtomicBool>,
+    stats: Arc<StreamStats>,
 ) -> impl FnMut() {
     let (has_init, should_stop, device_lost) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
@@ -574,13 +597,18 @@ fn get_worker_fn(
         const SPIKE_THRESH_DB: f32 = 6.0;
         let mut env: f32 = -1.0; // lazily seeded from the first processed frame
         let mut gain: f32 = 1.0;
+        let mut frames_since_report = 0usize;
+        let mut dropped_frames = 0usize;
         while !should_stop.load(Ordering::Relaxed) && !device_lost.load(Ordering::Relaxed) {
-            if rb_in.len() < n_in * ch {
-                // Sleep for half a hop size
-                sleep(Duration::from_secs_f32(
-                    df.hop_size as f32 / df.sr as f32 / 2.,
-                ));
+            let queued_in = rb_in.len();
+            if queued_in < n_in * ch {
+                sleep(Duration::from_millis(1));
                 continue;
+            }
+            // Fell behind (e.g. a stall): skip old input instead of staying late.
+            if queued_in > 3 * n_in * ch {
+                rb_in.skip((queued_in / ch - n_in) * ch);
+                dropped_frames += 1;
             }
             if let Some((ref mut r, ref mut buf)) = input_resampler.as_mut() {
                 let n = rb_in.pop_slice(&mut interleaved_in);
@@ -655,12 +683,31 @@ fn get_worker_fn(
             for s in interleaved_out.iter_mut() {
                 *s *= vol;
             }
-            let mut n = 0;
-            while n < interleaved_out.len() {
-                n += rb_out.push_slice(&interleaved_out[n..]);
+            // Drop this frame rather than queue more than the device needs.
+            if rb_out.len() + interleaved_out.len() > max_output_queue(&stats, n_out, ch) {
+                dropped_frames += 1;
+            } else {
+                rb_out.push_slice(&interleaved_out);
+                rb_out.sync();
             }
-            debug_assert_eq!(n, n_out * ch);
-            rb_out.sync();
+            frames_since_report += 1;
+            if frames_since_report * df.hop_size >= df.sr * 2 && log::log_enabled!(log::Level::Debug)
+            {
+                frames_since_report = 0;
+                let ms = |samples: usize, rate: usize| {
+                    samples as f32 / ch as f32 * 1000.0 / rate as f32
+                };
+                log::debug!(
+                    "DF queued audio: input {:.1} ms, output {:.1} ms \
+                     (output callback {} frames; underruns {}, input overflows {}, dropped frames {})",
+                    ms(rb_in.len(), input_sr),
+                    ms(rb_out.len(), output_sr),
+                    stats.out_callback_frames.load(Ordering::Relaxed),
+                    stats.underruns.load(Ordering::Relaxed),
+                    stats.input_overflows.load(Ordering::Relaxed),
+                    dropped_frames
+                );
+            }
             if let Some(ref mut s_lsnr) = s_lsnr.as_mut() {
                 s_lsnr.send(lsnr).expect("Failed to send to LSNR rb");
             }
@@ -774,6 +821,7 @@ impl DeepFilterCapture {
         let should_stop = Arc::new(AtomicBool::new(false));
         let has_init = Arc::new(AtomicBool::new(false));
         let device_lost = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(StreamStats::default());
         let s_spec = match (s_noisy, s_enh) {
             (Some(n), Some(e)) => Some((n, e)),
             _ => None,
@@ -797,13 +845,17 @@ impl DeepFilterCapture {
             Some(df_com),
             shared_volume,
             smoother_enabled,
+            stats.clone(),
         )));
         while !has_init.load(Ordering::Relaxed) {
             sleep(Duration::from_secs_f32(0.01));
         }
         log::info!("DeepFilter Capture init");
-        source.start(in_prod, ch, device_lost.clone())?;
-        sink.start(out_cons, ch, device_lost.clone())?;
+        // Output first: if input started first, audio would queue up while the
+        // output device opens (~1 s on some devices), and that delay would stay
+        // for the whole session.
+        sink.start(out_cons, ch, stats.clone(), device_lost.clone())?;
+        source.start(in_prod, ch, stats, device_lost.clone())?;
 
         Ok(Self {
             sr,
