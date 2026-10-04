@@ -4,7 +4,7 @@
 )]
 
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -140,6 +140,7 @@ struct LiveMusicRemover {
     r_device_event: Option<Receiver<DeviceEvent>>,
     shared_volume: Arc<AtomicU32>,
     system_volume: f32,
+    smoother_enabled: Arc<AtomicBool>,
     selected_model: ModelKind,
     dark_mode: bool,
     last_dark_mode: bool,
@@ -294,7 +295,7 @@ impl LiveMusicRemover {
             df_worker: None,
             lsnr: 0.,
             atten_lim: 100.,
-            post_filter_beta: 0.,
+            post_filter_beta: 1.,
             min_threshdb: -15.,
             max_erbthreshdb: 35.,
             max_dfthreshdb: 35.,
@@ -314,6 +315,7 @@ impl LiveMusicRemover {
             r_device_event: Some(r_device_event),
             shared_volume,
             system_volume: 1.0,
+            smoother_enabled: Arc::new(AtomicBool::new(true)),
             freq_axis_scale: 1.5,
             selected_model: ModelKind::default(),
             dark_mode: true,
@@ -441,6 +443,7 @@ impl LiveMusicRemover {
             Some(r_controls),
             Some(s_device_event),
             self.shared_volume.clone(),
+            self.smoother_enabled.clone(),
         ) {
             Ok(df_worker) => {
                 let w = (df_worker.sr / df_worker.frame_size * 10) as u32;
@@ -455,6 +458,11 @@ impl LiveMusicRemover {
                 self.r_enh = r_enh;
                 self.s_controls = s_controls;
                 self.r_device_event = Some(r_device_event);
+                // init_df always builds the model with post-filtering off; push the
+                // current slider value so a fresh start actually honors it.
+                self.s_controls
+                    .send((DfControl::PostFilterBeta, self.post_filter_beta))
+                    .ok();
             }
             Err(e) => {
                 log::error!("Failed to initialize DeepFilterNet audio capturing: {}", e);
@@ -1049,7 +1057,21 @@ impl eframe::App for LiveMusicRemover {
                                         .ok();
                                 }
 
-
+                                ui.add_space(4.0);
+                                let mut smoother_on =
+                                    self.smoother_enabled.load(Ordering::Relaxed);
+                                if ui
+                                    .checkbox(&mut smoother_on, "Transient Smoother")
+                                    .on_hover_text(
+                                        "Ducks short loud spikes (musical-noise blips) relative \
+                                         to the recent level. Toggle off to A/B against the raw \
+                                         DeepFilterNet output.",
+                                    )
+                                    .changed()
+                                {
+                                    self.smoother_enabled
+                                        .store(smoother_on, Ordering::Relaxed);
+                                }
 
                                 // ui.label("Threshold Min [dB]");
                                 //     if ui
