@@ -120,10 +120,11 @@ enum ModelChoice {
 }
 
 impl ModelChoice {
-    const ALL: [ModelChoice; 3] = [
+    const ALL: [ModelChoice; 4] = [
         ModelChoice::DeepFilter(ModelKind::Standard),
         ModelChoice::DeepFilter(ModelKind::LowLatency),
         ModelChoice::DpdfNet(DpdfModelKind::DpdfNet2_48kHr),
+        ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr),
     ];
 
     fn label(self) -> &'static str {
@@ -1398,6 +1399,9 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label("• Standard");
             ui.label("• Low Latency - Recommended.");
             ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
+            ui.label(
+                "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
+            );
             ui.label(
                 "It's a good idea to try both and see which one removes music best in your setup.",
             );

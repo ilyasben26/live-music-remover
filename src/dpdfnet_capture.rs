@@ -334,7 +334,8 @@ impl Worker {
                 }
             }
 
-            if let Err(e) = m.process(&inframe, &mut outframe) {
+            let result = m.process(&inframe, &mut outframe);
+            if let Err(e) = result {
                 log::error!("DPDFNet processing failed: {e:#}");
                 outframe.fill(0.0);
             }
