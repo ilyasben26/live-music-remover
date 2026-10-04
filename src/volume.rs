@@ -17,7 +17,7 @@ impl SystemVolume {
         unsafe {
             // CoInitializeEx is idempotent; RPC_E_CHANGED_MODE just means
             // another apartment type is already active on this thread, which
-            // is fine — we can still use COM objects.
+            // is fine; we can still use COM objects.
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
             let enumerator: IMMDeviceEnumerator =

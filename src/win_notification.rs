@@ -82,7 +82,7 @@ pub fn show_update_notification(latest_version: &str, release_url: &str) {
         latest_version
     );
 
-    if let Err(e) = notify("Live Music Remover — Update Available", &body, Some(release_url)) {
+    if let Err(e) = notify("Live Music Remover: Update Available", &body, Some(release_url)) {
         log::warn!("Failed to show update notification: {}", e);
     }
 }

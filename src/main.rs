@@ -24,6 +24,7 @@ mod noise;
 mod notify_update;
 mod resemble;
 mod resemble_capture;
+mod settings;
 mod volume;
 mod win_notification;
 use capture::{ModelKind, *};
@@ -31,6 +32,7 @@ use dpdfnet::DpdfModelKind;
 use dpdfnet_capture::DpdfNetCapture;
 use noise::NoiseControls;
 use resemble_capture::ResembleCapture;
+use settings::Settings;
 use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
@@ -201,6 +203,7 @@ enum Page {
     Main,
     About,
     Help,
+    Settings,
 }
 
 struct LiveMusicRemover {
@@ -241,6 +244,10 @@ struct LiveMusicRemover {
     router: Option<EguiRouter<LiveMusicRemover>>,
     current_page: Page,
     update_info: Arc<Mutex<Option<(String, String)>>>,
+    update_check_started: bool,
+    settings: Settings,
+    /// Whether the EULA window is open (on first run, or from the Settings page).
+    show_eula: bool,
 }
 
 struct SpecImage {
@@ -325,9 +332,7 @@ impl SpecImage {
 
 impl LiveMusicRemover {
     fn new() -> Self {
-        let update_info: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
-        let update_info_thread = Arc::clone(&update_info);
-        std::thread::spawn(move || notify_update::check_for_update(update_info_thread));
+        let settings = Settings::load();
 
         let (_s_lsnr, r_lsnr) = unbounded();
         let (_s_noisy, r_noisy) = unbounded();
@@ -420,18 +425,81 @@ impl LiveMusicRemover {
             last_dark_mode: true,
             router: None,
             current_page: Page::Main,
-            update_info,
+            update_info: Arc::new(Mutex::new(None)),
+            update_check_started: false,
+            show_eula: !settings.eula_accepted(),
+            settings,
         };
+        // Until the EULA is accepted, nothing is sent to GitHub.
+        if state.settings.eula_accepted() && state.settings.check_for_updates {
+            state.start_update_check();
+        }
 
         let router = EguiRouter::builder()
             .route("/", home_route)
             .route("/about", about_route)
             .route("/help", help_route)
+            .route("/settings", settings_route)
             .default_path("/")
             .transition(TransitionConfig::fade().with_duration(0.01))
             .build(&mut state);
         state.router = Some(router);
         state
+    }
+
+    /// Checks GitHub for a newer release in the background, once per run.
+    fn start_update_check(&mut self) {
+        if self.update_check_started {
+            return;
+        }
+        self.update_check_started = true;
+        let update_info = Arc::clone(&self.update_info);
+        std::thread::spawn(move || notify_update::check_for_update(update_info));
+    }
+
+    /// The EULA window. On first run the only ways out are "I accept" and
+    /// "Exit"; reopened from the Settings page it just has "Close".
+    fn eula_ui(&mut self, ctx: &egui::Context) {
+        let first_run = !self.settings.eula_accepted();
+        egui::Modal::new(egui::Id::new("eula")).show(ctx, |ui| {
+            ui.set_width(560.0);
+            ui.heading("End User License Agreement");
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .max_height(320.0)
+                .show(ui, |ui| ui.label(settings::EULA_TEXT));
+            ui.add_space(8.0);
+            ui.separator();
+            if ui
+                .checkbox(&mut self.settings.check_for_updates, "Check for updates")
+                .on_hover_text(UPDATE_CHECK_HINT)
+                .changed()
+                && !first_run
+            {
+                self.settings.save();
+                if self.settings.check_for_updates {
+                    self.start_update_check();
+                }
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if first_run {
+                    if ui.button("I accept").clicked() {
+                        self.settings.eula_accepted_version = settings::EULA_VERSION;
+                        self.settings.save();
+                        self.show_eula = false;
+                        if self.settings.check_for_updates {
+                            self.start_update_check();
+                        }
+                    }
+                    if ui.button("Exit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                } else if ui.button("Close").clicked() {
+                    self.show_eula = false;
+                }
+            });
+        });
     }
 
     fn poll_channels(&mut self, ctx: &egui::Context) {
@@ -936,6 +1004,13 @@ impl eframe::App for LiveMusicRemover {
                     navigate_to = Some("/about".to_string());
                 }
                 if ui
+                    .selectable_label(self.current_page == Page::Settings, "⚙  Settings")
+                    .clicked()
+                {
+                    self.current_page = Page::Settings;
+                    navigate_to = Some("/settings".to_string());
+                }
+                if ui
                     .add(egui::Button::new("☕  Buy me a coffee").frame(false))
                     .on_hover_text("https://ko-fi.com/ilyasdev")
                     .clicked()
@@ -1397,7 +1472,7 @@ impl eframe::App for LiveMusicRemover {
                             //     ui.horizontal(|ui| {
                             //         ui.spinner();
                             //         let status = if self.lsnr < 5.0 {
-                            //             "Music detected — removing"
+                            //             "Music detected, removing"
                             //         } else {
                             //             "No music detected"
                             //         };
@@ -1432,6 +1507,10 @@ impl eframe::App for LiveMusicRemover {
         });
 
         self.router = Some(router);
+
+        if self.show_eula {
+            self.eula_ui(ctx);
+        }
     }
 }
 
@@ -1521,19 +1600,51 @@ fn about_route() -> impl Route<LiveMusicRemover> {
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Built with").strong());
             ui.add_space(4.0);
-            ui.label("• DeepFilterNet  — neural network for music/noise suppression");
-            ui.label("• DPDFNet        — speech enhancement model by Ceva (Apache-2.0)");
-            ui.label("• Resemble Enhance — speech denoiser by Resemble AI (MIT)");
-            ui.label("• ONNX Runtime   — inference engine for DPDFNet and Resemble Enhance");
-            ui.label("• egui / eframe  — immediate-mode GUI framework");
-            ui.label("• cpal           — cross-platform audio I/O");
-            ui.label("• rubato         — high-quality audio resampling");
+            ui.label("• DeepFilterNet: neural network for music/noise suppression");
+            ui.label("• DPDFNet: speech enhancement model by Ceva (Apache-2.0)");
+            ui.label("• Resemble Enhance: speech denoiser by Resemble AI (MIT)");
+            ui.label("• ONNX Runtime: inference engine for DPDFNet and Resemble Enhance");
+            ui.label("• egui / eframe: immediate-mode GUI framework");
+            ui.label("• cpal: cross-platform audio I/O");
+            ui.label("• rubato: high-quality audio resampling");
             ui.add_space(16.0);
             ui.separator();
             ui.add_space(8.0);
             ui.label(egui::RichText::new("Source code").strong());
             ui.add_space(4.0);
             ui.label("https://github.com/ilyasben26/live-music-remover");
+        });
+    }
+}
+
+const UPDATE_CHECK_HINT: &str = "About once a day, asks GitHub (api.github.com) whether a new version is available. This lets GitHub see your IP address.";
+
+fn settings_route() -> impl Route<LiveMusicRemover> {
+    |ui: &mut egui::Ui, state: &mut LiveMusicRemover| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(16.0);
+            ui.heading("Settings");
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            if ui
+                .checkbox(&mut state.settings.check_for_updates, "Check for updates")
+                .changed()
+            {
+                state.settings.save();
+                if state.settings.check_for_updates {
+                    state.start_update_check();
+                }
+            }
+            ui.label(
+                egui::RichText::new(UPDATE_CHECK_HINT)
+                    .small()
+                    .color(egui::Color32::GRAY),
+            );
+            ui.add_space(16.0);
+            if ui.button("View EULA").clicked() {
+                state.show_eula = true;
+            }
         });
     }
 }
@@ -1553,7 +1664,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label("TODO: put link to youtube video tutorial");
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Step 1 — Install a virtual audio cable").strong());
+            ui.label(egui::RichText::new("Step 1: Install a virtual audio cable").strong());
             ui.add_space(4.0);
             ui.label(
                 "Install VB-CABLE (https://vb-audio.com/Cable). This creates a virtual \
@@ -1561,7 +1672,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             );
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Step 2 — Route your audio").strong());
+            ui.label(egui::RichText::new("Step 2: Route your audio").strong());
             ui.add_space(4.0);
             ui.label(
                 "In your streaming software or system settings, set the playback device \
@@ -1569,7 +1680,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             );
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Step 3 — Select devices").strong());
+            ui.label(egui::RichText::new("Step 3: Select devices").strong());
             ui.add_space(4.0);
             ui.label(
                 "• Input device:  select \"CABLE Output\" (what your source is playing into).",
@@ -1578,24 +1689,30 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label("  Use \"Refresh Devices\" if a device is missing from the list.");
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Step 4 — Choose a model").strong());
+            ui.label(egui::RichText::new("Step 4: Choose a model").strong());
             ui.add_space(4.0);
-            ui.label("• Standard");
-            ui.label("• Low Latency");
-            ui.label("• DPDFNet-2 48 kHz HR - alternative full-band model.");
             ui.label(
-                "• DPDFNet-8 48 kHz HR - larger DPDFNet, separates voice from music better.                  Uses the most CPU (two cores).",
+                "• Resemble Enhance (recommended, default): Resemble AI's speech denoiser. \
+                 Removes music best. Runs on the GPU when available (lower latency) or on the \
+                 CPU (higher latency).",
             );
             ui.label(
-                "• Resemble Enhance - Recommended (default). Resemble AI's speech denoiser. Runs on the GPU \
-                 when available (lower latency) or on the CPU (higher latency).",
+                "• DPDFNet-8 48 kHz HR: the larger DPDFNet model. Separates voice from music \
+                 better than DPDFNet-2 but uses the most CPU (two cores).",
             );
+            ui.label("• DPDFNet-2 48 kHz HR: a lighter DPDFNet model with low latency.");
+            ui.label("• DeepFilterNet3: a lightweight CPU model with low latency.");
             ui.label(
-                "It's a good idea to try both and see which one removes music best in your setup.",
+                "• DeepFilterNet3 LL: a low-latency variant of DeepFilterNet3, with the lowest \
+                 latency of all models.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "It's a good idea to try a few and see which one removes music best in your setup.",
             );
 
             ui.add_space(12.0);
-            ui.label(egui::RichText::new("Step 5 — Start processing").strong());
+            ui.label(egui::RichText::new("Step 5: Start processing").strong());
             ui.add_space(4.0);
             ui.label("Click ▶ Start. Processed audio plays on your output device.");
 
@@ -1605,22 +1722,30 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label(egui::RichText::new("Controls").strong());
             ui.add_space(4.0);
             ui.label(
-                "• Noise Attenuation [dB] — how aggressively music is removed. 0 means no filtering, 100 means maximum filtering. It's recommended to keep it at 100.",
+                "• Noise Attenuation [dB]: how aggressively music is removed. 0 means no \
+                 filtering, 100 means maximum filtering. It's recommended to keep it at 100.",
             );
             ui.label(
-                "• Post Filter Beta — smooths the filter output. \
-                 Increase if you hear musical artefacts.",
+                "• Post Filter Beta (DeepFilterNet3 only): smooths the filter's effect on the \
+                 audio. Increase if you hear musical artefacts.",
             );
-            ui.label("• Frequency Axis Scale — zooms the spectrogram visualisation.");
-
-            ui.add_space(16.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("SNR Gauge").strong());
-            ui.add_space(4.0);
             ui.label(
-                "TODO: Add SNR gauge description",
+                "• Transient Smoother: turns down short, loud blips of music relative to the \
+                 recent level. Turn it off to hear the model's raw output.",
             );
+            ui.label(
+                "• Input Noise [dB] (experimental): adds pink noise to the audio before the \
+                 model, in an effort to reduce musical artefacts. Far left is off.",
+            );
+            ui.label(
+                "• Comfort Noise [dB]: adds faint pink noise after the model to mask musical \
+                 artefacts. Far left is off.",
+            );
+            ui.label(
+                "• Use GPU (Resemble Enhance only): runs the model on the GPU for lower \
+                 latency. Turn it off to run on the CPU.",
+            );
+            ui.label("• Frequency Axis Scale: zooms the spectrogram visualisation.");
 
             ui.add_space(16.0);
             ui.separator();
@@ -1628,9 +1753,20 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.label(egui::RichText::new("Reporting bugs / issues").strong());
             ui.add_space(4.0);
             ui.label(
-                "TODO: Add instructions and motivations for submiting a github issue",
-            )
-            
+                "Live Music Remover is a work in progress, so you may run into bugs. If \
+                 something goes wrong, closing and reopening the app usually fixes it.",
+            );
+            ui.add_space(4.0);
+            ui.label(
+                "Please also report it on GitHub so it can be fixed for everyone. Include \
+                 what you were doing, which model and devices you had selected, and what \
+                 you expected to happen. Ideas for improving music removal are welcome too.",
+            );
+            ui.add_space(4.0);
+            ui.hyperlink_to(
+                "Open an issue on GitHub",
+                "https://github.com/ilyasben26/live-music-remover/issues",
+            );
         });
     }
 }

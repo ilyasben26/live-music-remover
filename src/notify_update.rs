@@ -110,7 +110,7 @@ fn is_newer(latest: &str, current: &str) -> bool {
 pub fn check_for_update(update_info: Arc<Mutex<Option<(String, String)>>>) {
     let current = env!("CARGO_PKG_VERSION");
 
-    // On every startup, restore persisted release info — but only if it's still
+    // On every startup, restore persisted release info, but only if it's still
     // newer than the running binary (handles the case where the user downloaded
     // the update and is now running the new version).
     if let Some((saved_tag, saved_url)) = load_known_release() {
@@ -176,7 +176,7 @@ pub fn check_for_update(update_info: Arc<Mutex<Option<(String, String)>>>) {
         }
         crate::win_notification::show_update_notification(latest_tag, html_url);
     } else {
-        // No newer release — ensure any stale cache is cleared.
+        // No newer release: ensure any stale cache is cleared.
         clear_known_release();
     }
 }
