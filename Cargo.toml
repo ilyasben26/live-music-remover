@@ -70,3 +70,4 @@ realfft = "3.5"
 
 [build-dependencies]
 resvg = "0.37"
+winresource = "0.1"
