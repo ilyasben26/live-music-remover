@@ -27,7 +27,11 @@ A Windows app that removes background music and noise from your computer's audio
 > Another Note: Live Music Remover currently supports Windows only. MacOS integration is planned. For Linux users who want to remove music in real-time from their system's audio, there is a native way to do it on Linux using a LADSPA plugin, see this [here](https://github.com/Rikorose/DeepFilterNet/blob/main/ladspa/filter-chain-configs/deepfilter-stereo-sink.conf). (A video tutorial on the Linux setup is coming soon)
 
 ## Demo
-todo!
+
+
+https://github.com/user-attachments/assets/1f2fc4e7-bb5e-4ed8-830d-64f3b0f55d1c
+
+
 
 ## Instructions
 
