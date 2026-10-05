@@ -12,8 +12,8 @@
   [![GitHub license](https://img.shields.io/github/license/ilyasben26/live-music-remover)](https://github.com/ilyasben26/live-music-remover/blob/main/LICENSE)
   [![GitHub issues](https://img.shields.io/github/issues/ilyasben26/live-music-remover?color=blue)](https://github.com/ilyasben26/live-music-remover/issues)
   ![Platform](https://img.shields.io/badge/platform-Windows-blue?logo=windows)
-  <!-- ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyasben26/live-music-remover/total) -->
- <!-- ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ilyasben26/live-music-remover/rust.yml) -->
+  ![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/ilyasben26/live-music-remover/total)
+ ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/ilyasben26/live-music-remover/rust.yml)
 
   [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A0A21O64X2)
 </div>
