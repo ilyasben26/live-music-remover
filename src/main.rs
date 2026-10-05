@@ -30,10 +30,10 @@ mod win_notification;
 use capture::{ModelKind, *};
 use dpdfnet::DpdfModelKind;
 use dpdfnet_capture::DpdfNetCapture;
+use egui_router::{EguiRouter, Route, TransitionConfig};
 use noise::NoiseControls;
 use resemble_capture::ResembleCapture;
 use settings::Settings;
-use egui_router::{EguiRouter, Route, TransitionConfig};
 
 use crate::devices::{
     device_exists, find_cable, get_input_devices, get_output_devices, set_output_device,
@@ -140,9 +140,7 @@ impl ModelChoice {
     /// (delays measured on an RTX 3060 laptop).
     fn label(self) -> &'static str {
         match self {
-            ModelChoice::DeepFilter(ModelKind::Standard) => {
-                "DeepFilterNet3 (low latency) (CPU)"
-            }
+            ModelChoice::DeepFilter(ModelKind::Standard) => "DeepFilterNet3 (low latency) (CPU)",
             ModelChoice::DeepFilter(ModelKind::LowLatency) => {
                 "DeepFilterNet3 LL (lowest latency) (CPU)"
             }
@@ -152,9 +150,7 @@ impl ModelChoice {
             ModelChoice::DpdfNet(DpdfModelKind::DpdfNet8_48kHr) => {
                 "DPDFNet-8 48 kHz HR (better removal) (CPU)"
             }
-            ModelChoice::Resemble => {
-                "Resemble Enhance (best removal) (high latency) (GPU)"
-            }
+            ModelChoice::Resemble => "Resemble Enhance (best removal) (high latency) (GPU)",
         }
     }
 
@@ -613,7 +609,14 @@ impl LiveMusicRemover {
                 self.smoother_enabled.clone(),
                 self.noise.clone(),
             )
-            .map(|w| (w.sr, w.frame_size, w.freq_size, CaptureWorker::DeepFilter(w))),
+            .map(|w| {
+                (
+                    w.sr,
+                    w.frame_size,
+                    w.freq_size,
+                    CaptureWorker::DeepFilter(w),
+                )
+            }),
             ModelChoice::DpdfNet(kind) => DpdfNetCapture::new(
                 kind,
                 input_device,
@@ -758,11 +761,12 @@ impl LiveMusicRemover {
                 }
                 let delay_ms = w.delay_ms();
                 if delay_ms > 0 {
-                    ui.label(format!("·  Latency ≈ {delay_ms} ms")).on_hover_text(
-                        "Estimated time from input to output: the model's own latency plus \
+                    ui.label(format!("·  Latency ≈ {delay_ms} ms"))
+                        .on_hover_text(
+                            "Estimated time from input to output: the model's own latency plus \
                          the audio buffered on each side. Excludes the audio devices' \
                          internal buffers.",
-                    );
+                        );
                 }
             });
         }
@@ -1570,13 +1574,14 @@ fn about_route() -> impl Route<LiveMusicRemover> {
                 ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                 if let Ok(info) = state.update_info.lock() {
                     if let Some((latest, url)) = info.as_ref() {
-                        ui.add(
-                            egui::Hyperlink::from_label_and_url(
-                                egui::RichText::new(format!("New version v{} is available", latest.trim_start_matches('v')))
-                                    .color(egui::Color32::YELLOW),
-                                url,
-                            ),
-                        );
+                        ui.add(egui::Hyperlink::from_label_and_url(
+                            egui::RichText::new(format!(
+                                "New version v{} is available",
+                                latest.trim_start_matches('v')
+                            ))
+                            .color(egui::Color32::YELLOW),
+                            url,
+                        ));
                     }
                 }
             });
@@ -1661,7 +1666,7 @@ fn help_route() -> impl Route<LiveMusicRemover> {
             ui.add_space(8.0);
             ui.separator();
 
-            ui.label("TODO: put link to youtube video tutorial");
+            // ui.label("TODO: put link to youtube video tutorial");
 
             ui.add_space(12.0);
             ui.label(egui::RichText::new("Step 1: Install a virtual audio cable").strong());
