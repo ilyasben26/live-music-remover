@@ -39,7 +39,7 @@ https://github.com/user-attachments/assets/1f2fc4e7-bb5e-4ed8-830d-64f3b0f55d1c
 <!-- todo!(add pictures to the steps below to make it clearer) -->
 - To capture the system's audio and route it to *Live Music Remover*, install VB-CABLE (https://vb-audio.com/Cable).
 - In the windows sound setting, select **CABLE Input (VB-Audio Virtual Cable)**.`
-- Download the latest release of *Live Music Remover* from todo!(insert releases latest link)
+- Download the latest release of *Live Music Remover* from [here](https://github.com/ilyasben26/live-music-remover/releases/latest).
 - Launch the downloaded executable. You might get a Windows SmartScreen warning that it can harm your device, just click on *Run Anyway*. It's totally safe, you can read the code and compile the binary yourself if you don't trust me.
 
 
